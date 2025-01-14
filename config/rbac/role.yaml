@@ -1,42 +1,70 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: manager-role
 rules:
-# Core resources
-- apiGroups: [""]
-  resources: ["namespaces"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-- apiGroups: [""]
-  resources: ["resourcequotas"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-- apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch", "create", "delete"]
-- apiGroups: [""]
-  resources: ["persistentvolumeclaims"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-
-# Batch resources for build jobs
-- apiGroups: ["batch"]
-  resources: ["jobs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-
-# ShapeBlock CRDs
-- apiGroups: ["apps.shapeblock.io"]
-  resources: ["projects", "projects/status"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-- apiGroups: ["apps.shapeblock.io"]
-  resources: ["appbuilds", "appbuilds/status"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-- apiGroups: ["apps.shapeblock.io"]
-  resources: ["services", "services/status"]
-  verbs: ["get", "list", "watch", "create", "update", "patch"]
-
-# Helm resources (for deployments)
-- apiGroups: ["helm.cattle.io"]
-  resources: ["helmcharts", "helmchartconfigs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - appbuilds
+  - projects
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - appbuilds/finalizers
+  - projects/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - appbuilds/status
+  - projects/status
+  - services/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - helm.cattle.io
+  resources:
+  - helmcharts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

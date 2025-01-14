@@ -140,4 +140,147 @@ This approach would:
 - More native K8s experience
 - Easier to maintain and debug
 
+## More context
 
+This project uses Operator SDK to generate the operator. The operator is deployed in each k8s cluster managed by Shapeblock. The operator is responsible for handling the lifecycle of the projects, apps, app builds and services.
+
+The operator relays the status of these resources to the shapeblock server via websockets. The shapeblock server then updates the UI with the status of the resources.
+
+## Project CR
+
+```yaml
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: Project
+metadata:
+  name: my-project
+spec:
+  displayName: "My Project"
+  description: "A sample project"
+```
+
+Handles namespace creation, copies registry secret from "shapeblock" namespace to the newly created namespace.
+
+## App CR
+
+
+```yaml
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: App
+metadata:
+  name: sample-app
+  namespace: my-project
+spec:
+  displayName: "Sample Application"
+  description: "A sample application to demonstrate the App CR"
+
+  git:
+    url: "https://github.com/example/sample-app.git"
+    branch: "main"
+    secretName: "git-credentials"  # Optional
+    isPrivate: true
+
+  registry:
+    url: "registry.shapeblock.io"
+    secretName: "registry-credentials"
+
+status:
+  phase: "Pending"
+  message: "Initializing application"
+  latestBuild: ""
+  lastUpdated: "2024-03-20T10:00:00Z"
+# Dockerfile build
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: App
+metadata:
+  name: dockerfile-app
+  namespace: my-project
+spec:
+  displayName: "Dockerfile App"
+  description: "App built using Dockerfile"
+  git:
+    url: "https://github.com/example/app.git"
+    branch: "main"
+  registry:
+    url: "registry.shapeblock.io"
+    secretName: "registry-credentials"
+  build:
+    type: "dockerfile"
+---
+# Buildpack build
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: App
+metadata:
+  name: buildpack-app
+  namespace: my-project
+spec:
+  displayName: "Buildpack App"
+  description: "App built using Cloud Native Buildpacks"
+  git:
+    url: "https://github.com/example/app.git"
+    branch: "main"
+  registry:
+    url: "registry.shapeblock.io"
+    secretName: "registry-credentials"
+  build:
+    type: "buildpack"
+    builderImage: "paketobuildpacks/builder:base"
+---
+# Pre-built image
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: App
+metadata:
+  name: prebuilt-app
+  namespace: my-project
+spec:
+  displayName: "Pre-built App"
+  description: "App using existing container image"
+  git:
+    url: "https://github.com/example/app.git"
+    branch: "main"
+  registry:
+    url: "registry.shapeblock.io"
+    secretName: "registry-credentials"
+  build:
+    type: "image"
+    image: "registry.shapeblock.io/my-project/sample-app:v1.0.0"
+```
+
+Creates app ssh secret, nothing more. Also, stores the meta information like git url, registry info etc. Decides the build strategy(dockerfile or buildpacks).
+
+## AppBuild CR
+
+```yaml
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: AppBuild
+metadata:
+  name: sample-app-build-1
+  namespace: my-project
+spec:
+  appName: "sample-app"    # References the App CR name
+  gitRef: "main"          # Git reference to build (commit, branch, tag)
+  imageTag: "v1.0.0"      # Tag for the built image
+
+  buildVars:              # Optional build environment variables
+    - key: "NODE_ENV"
+      value: "production"
+    - key: "BUILD_FLAG"
+      value: "true"
+
+  helmValues:             # Optional Helm values for deployment
+    replicaCount: 2
+    env:
+      NODE_ENV: "production"
+    ingress:
+      enabled: true
+      hosts:
+        - "myapp.example.com"
+
+status:
+  phase: "Pending"        # Pending, Building, Completed, Failed
+  message: "Build initialized"
+  podName: ""            # Will be set when build pod is created
+  startTime: "2024-03-20T10:00:00Z"
+  completionTime: ""     # Will be set when build completes
+```
+
+Handles the build process.

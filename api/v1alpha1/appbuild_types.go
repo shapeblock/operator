@@ -23,47 +23,36 @@ import (
 
 // AppBuildSpec defines the desired state of AppBuild
 type AppBuildSpec struct {
-	// AppName is the name of the application
+	// AppName references the App CR
 	AppName string `json:"appName"`
 
-	// ImageTag is the tag for the built image
+	// Git reference to build (commit, branch, tag)
+	GitRef string `json:"gitRef"`
+
+	// ImageTag for this specific build
 	ImageTag string `json:"imageTag"`
 
-	// BuildType specifies how to build the image: dockerfile, buildpack, or prebuilt
-	BuildType string `json:"buildType"`
-
-	// Git repository configuration
-	Git GitSpec `json:"git,omitempty"`
-
-	// Registry configuration
-	RegistryURL string `json:"registryURL"`
-
-	// Previous image for buildpack builds
-	PreviousImage string `json:"previousImage,omitempty"`
-
-	// Builder image for buildpack builds
-	BuilderImage string `json:"builderImage,omitempty"`
-
-	// Build environment variables
+	// Additional build environment variables
 	BuildVars []BuildVar `json:"buildVars,omitempty"`
 
-	// Indicates if the git repository is private
-	IsPrivate bool `json:"isPrivate,omitempty"`
-
-	// Raw helm values to override default nxs-universal-chart values
-	// +optional
+	// HelmValues for deployment
 	HelmValues *runtime.RawExtension `json:"helmValues,omitempty"`
 }
 
-type GitSpec struct {
+type SourceSpec struct {
+	// Git repository information
+	Git *GitSource `json:"git,omitempty"`
+}
+
+type GitSource struct {
 	// URL of the git repository
 	URL string `json:"url"`
 
-	// Git reference (branch, tag, or commit)
+	// Reference to checkout (branch, tag, commit)
 	Ref string `json:"ref"`
 
-	// SSH key secret name for private repositories
-	SSHKeySecret string `json:"sshKeySecret,omitempty"`
+	// Whether the repository is private
+	IsPrivate bool `json:"isPrivate,omitempty"`
 }
 
 type BuildVar struct {
@@ -76,30 +65,23 @@ type BuildVar struct {
 
 // AppBuildStatus defines the observed state of AppBuild
 type AppBuildStatus struct {
-	// Current phase of the build: Pending, Building, Completed, Failed
+	// Current phase of the build
 	Phase string `json:"phase,omitempty"`
 
-	// Human-readable message indicating details about current phase
+	// Human-readable message
 	Message string `json:"message,omitempty"`
 
-	// Name of the pod running the build
+	// Build pod details for log streaming
 	PodName string `json:"podName,omitempty"`
 
-	// Namespace of the pod running the build
-	PodNamespace string `json:"podNamespace,omitempty"`
-
-	// Time when the build started
-	StartTime *metav1.Time `json:"startTime,omitempty"`
-
-	// Time when the build completed
+	// Timestamps
+	StartTime      *metav1.Time `json:"startTime,omitempty"`
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
-
-	// Complete build logs (populated after build completion)
-	Logs string `json:"logs,omitempty"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="App",type="string",JSONPath=".spec.appName"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 

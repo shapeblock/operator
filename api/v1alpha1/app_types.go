@@ -18,11 +18,22 @@ type AppSpec struct {
 	// Registry configuration for storing built images
 	Registry RegistrySpec `json:"registry"`
 
-	// Build configuration
+	// Build configuration template
 	Build BuildSpec `json:"build"`
+}
 
-	// Service configuration
-	Service ServiceSpec `json:"service"`
+type GitSpec struct {
+	// URL of the git repository
+	URL string `json:"url"`
+
+	// Branch to use by default
+	Branch string `json:"branch,omitempty"`
+
+	// Secret name containing git credentials
+	SecretName string `json:"secretName,omitempty"`
+
+	// IsPrivate indicates if the git repository is private
+	IsPrivate bool `json:"isPrivate,omitempty"`
 }
 
 type RegistrySpec struct {
@@ -40,26 +51,20 @@ type BuildSpec struct {
 	// Builder image for buildpack builds
 	BuilderImage string `json:"builderImage,omitempty"`
 
-	// Build environment variables
-	Env []BuildVar `json:"env,omitempty"`
+	// Prebuilt image
+	Image string `json:"image,omitempty"`
 }
 
 // AppStatus defines the observed state of App
 type AppStatus struct {
-	// Current phase of the application: Pending, Building, Deploying, Running, Failed
+	// Current phase of the application
 	Phase string `json:"phase,omitempty"`
 
-	// Human-readable message indicating details about current phase
+	// Human-readable message
 	Message string `json:"message,omitempty"`
 
 	// Latest successful build
 	LatestBuild string `json:"latestBuild,omitempty"`
-
-	// Current service deployment
-	CurrentService string `json:"currentService,omitempty"`
-
-	// URL where the application is accessible
-	URL string `json:"url,omitempty"`
 
 	// Last time the status was updated
 	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
@@ -69,7 +74,6 @@ type AppStatus struct {
 //+kubebuilder:subresource:status
 //+kubebuilder:printcolumn:name="Display Name",type="string",JSONPath=".spec.displayName"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
-//+kubebuilder:printcolumn:name="URL",type="string",JSONPath=".status.url"
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // App is the Schema for the apps API

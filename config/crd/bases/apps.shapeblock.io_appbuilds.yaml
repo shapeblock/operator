@@ -1,6 +1,9 @@
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: appbuilds.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -11,78 +14,92 @@ spec:
     singular: appbuild
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.appName
+      name: App
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
+        description: AppBuild is the Schema for the appbuilds API
         properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
           spec:
+            description: AppBuildSpec defines the desired state of AppBuild
             properties:
               appName:
-                type: string
-              imageTag:
-                type: string
-              buildType:
-                type: string
-                enum: ["dockerfile", "buildpack", "prebuilt"]
-              git:
-                properties:
-                  url:
-                    type: string
-                  ref:
-                    type: string
-                  sshKeySecret:
-                    type: string
-                required:
-                - url
-                - ref
-                type: object
-              registryURL:
-                type: string
-              previousImage:
-                type: string
-              builderImage:
+                description: AppName references the App CR
                 type: string
               buildVars:
+                description: Additional build environment variables
                 items:
                   properties:
                     key:
+                      description: Name of the build variable
                       type: string
                     value:
+                      description: Value of the build variable
                       type: string
                   required:
                   - key
                   - value
                   type: object
                 type: array
-              isPrivate:
-                type: boolean
+              gitRef:
+                description: Git reference to build (commit, branch, tag)
+                type: string
               helmValues:
-                # Allow any valid YAML/JSON structure
-                x-kubernetes-preserve-unknown-fields: true
+                description: HelmValues for deployment
                 type: object
+                x-kubernetes-preserve-unknown-fields: true
+              imageTag:
+                description: ImageTag for this specific build
+                type: string
             required:
             - appName
+            - gitRef
             - imageTag
-            - buildType
-            - registryURL
             type: object
           status:
+            description: AppBuildStatus defines the observed state of AppBuild
             properties:
-              phase:
-                type: string
-              message:
-                type: string
-              podName:
-                type: string
-              podNamespace:
-                type: string
-              startTime:
-                format: date-time
-                type: string
               completionTime:
                 format: date-time
                 type: string
-              logs:
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                description: Current phase of the build
+                type: string
+              podName:
+                description: Build pod details for log streaming
+                type: string
+              startTime:
+                description: Timestamps
+                format: date-time
                 type: string
             type: object
         type: object
@@ -90,10 +107,3 @@ spec:
     storage: true
     subresources:
       status: {}
-    additionalPrinterColumns:
-    - jsonPath: .status.phase
-      name: Status
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date

@@ -18,19 +18,20 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/errors"
-
-	"github.com/shapeblock/operator/utils"
+	"github.com/shapeblock/operator/pkg/utils"
 )
 
 // ProjectReconciler reconciles a Project object
@@ -40,19 +41,12 @@ type ProjectReconciler struct {
 	WebsocketClient *utils.WebsocketClient
 }
 
-// +kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects/finalizers,verbs=update
+//+kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Project object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
@@ -62,12 +56,22 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Initialize status if not set
+	if project.Status.Phase == "" {
+		project.Status.Phase = "Initializing"
+		project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+		if err := r.Status().Update(ctx, project); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.sendProjectStatus(project)
+	}
+
 	// Create namespace if it doesn't exist
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: project.Spec.Name,
 			Labels: map[string]string{
-				"shapeblock.io/project-id": project.Spec.ID,
+				"shapeblock.io/project-id": project.Name,
 				"shapeblock.io/managed-by": "shapeblock-operator",
 			},
 		},
@@ -76,7 +80,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Create(ctx, ns); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			log.Error(err, "Failed to create namespace")
-			return ctrl.Result{}, err
+			return r.failProject(ctx, project, fmt.Sprintf("Failed to create namespace: %v", err))
 		}
 	}
 
@@ -84,54 +88,41 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if project.Spec.RegistrySecret != "" {
 		if err := r.copyRegistrySecret(ctx, project); err != nil {
 			log.Error(err, "Failed to copy registry secret")
-			return ctrl.Result{}, err
+			return r.failProject(ctx, project, fmt.Sprintf("Failed to copy registry secret: %v", err))
 		}
 	}
 
-	// Apply resource quotas if specified
-	if project.Spec.ResourceQuota != nil {
-		if err := r.applyResourceQuota(ctx, project); err != nil {
-			log.Error(err, "Failed to apply resource quota")
+	// Update status to Active
+	if project.Status.Phase != "Active" {
+		project.Status.Phase = "Active"
+		project.Status.Message = "Project setup completed"
+		project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+		if err := r.Status().Update(ctx, project); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-
-	// Update status
-	project.Status.Phase = "Active"
-	if err := r.Status().Update(ctx, project); err != nil {
-		log.Error(err, "Failed to update project status")
-		return ctrl.Result{}, err
-	}
-
-	// Notify ShapeBlock server
-	if r.WebsocketClient != nil {
-		r.WebsocketClient.SendStatus(utils.StatusUpdate{
-			ResourceType: "Project",
-			Name:         project.Name,
-			Namespace:    project.Namespace,
-			Status:       "Active",
-			Message:      "Project setup completed",
-		})
+		r.sendProjectStatus(project)
 	}
 
 	return ctrl.Result{}, nil
 }
 
 func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *appsv1alpha1.Project) error {
-	// Get source secret
 	sourceSecret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      project.Spec.RegistrySecret,
-		Namespace: "shapeblock-system", // predefined namespace for source secrets
+		Namespace: "shapeblock",
 	}, sourceSecret); err != nil {
 		return err
 	}
 
-	// Create new secret in project namespace
 	newSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "registry-credentials",
 			Namespace: project.Spec.Name,
+			Labels: map[string]string{
+				"shapeblock.io/project-id": project.Name,
+				"shapeblock.io/managed-by": "shapeblock-operator",
+			},
 		},
 		Type: sourceSecret.Type,
 		Data: sourceSecret.Data,
@@ -140,21 +131,32 @@ func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *app
 	return r.Create(ctx, newSecret)
 }
 
-func (r *ProjectReconciler) applyResourceQuota(ctx context.Context, project *appsv1alpha1.Project) error {
-	quota := &corev1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "project-quota",
-			Namespace: project.Spec.Name,
-		},
-		Spec: corev1.ResourceQuotaSpec{
-			Hard: project.Spec.ResourceQuota.ToResourceList(),
-		},
+func (r *ProjectReconciler) failProject(ctx context.Context, project *appsv1alpha1.Project, message string) (ctrl.Result, error) {
+	project.Status.Phase = "Failed"
+	project.Status.Message = message
+	project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+	if err := r.Status().Update(ctx, project); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	return r.Create(ctx, quota)
+	r.sendProjectStatus(project)
+	return ctrl.Result{}, fmt.Errorf(message)
 }
 
-// SetupWithManager sets up the controller with the Manager.
+func (r *ProjectReconciler) sendProjectStatus(project *appsv1alpha1.Project) {
+	if r.WebsocketClient == nil {
+		return
+	}
+
+	update := utils.NewStatusUpdate("Project", project.Name, project.Namespace)
+	update.Status = project.Status.Phase
+	update.Message = project.Status.Message
+	update.Labels = map[string]string{
+		"shapeblock.io/project-id": project.Name,
+	}
+
+	r.WebsocketClient.SendStatus(update)
+}
+
 func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Project{}).

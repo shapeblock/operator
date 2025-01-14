@@ -15,7 +15,7 @@ import (
 // StatusUpdate represents the message structure sent to the ShapeBlock server
 type StatusUpdate struct {
 	// Resource identification
-	ResourceType string `json:"resourceType"` // "AppBuild", "Project", "Service"
+	ResourceType string `json:"resourceType"` // "AppBuild", "App"
 	Name         string `json:"name"`
 	Namespace    string `json:"namespace"`
 
@@ -33,13 +33,18 @@ type StatusUpdate struct {
 	EndTime   string `json:"endTime,omitempty"`
 
 	// Additional metadata
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// Build-specific details
-	BuildType string `json:"buildType,omitempty"` // "buildpack", "dockerfile", "prebuilt"
-	ImageTag  string `json:"imageTag,omitempty"`
-	Registry  string `json:"registry,omitempty"`
+	AppName  string `json:"appName,omitempty"`
+	ImageTag string `json:"imageTag,omitempty"`
+	Logs     string `json:"logs,omitempty"` // Only included in final status
+}
+
+type BuildLogMessage struct {
+	Type    string `json:"type"`
+	BuildID string `json:"buildId"`
+	Log     string `json:"log"`
 }
 
 // Helper function to create a status update
@@ -50,37 +55,7 @@ func NewStatusUpdate(resourceType string, name string, namespace string) StatusU
 		Namespace:    namespace,
 		Timestamp:    time.Now().UTC().Format(time.RFC3339),
 		Labels:       make(map[string]string),
-		Annotations:  make(map[string]string),
 	}
-}
-
-// Example usage in the AppBuild controller:
-func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
-	if r.WebsocketClient == nil {
-		return
-	}
-
-	update := NewStatusUpdate("AppBuild", build.Name, build.Namespace)
-	update.Status = build.Status.Phase
-	update.Message = build.Status.Message
-	update.PodName = build.Status.PodName
-	update.PodNamespace = build.Status.PodNamespace
-	update.BuildType = build.Spec.BuildType
-	update.ImageTag = build.Spec.ImageTag
-	update.Registry = build.Spec.RegistryURL
-
-	if build.Status.StartTime != nil {
-		update.StartTime = build.Status.StartTime.Format(time.RFC3339)
-	}
-	if build.Status.CompletionTime != nil {
-		update.EndTime = build.Status.CompletionTime.Format(time.RFC3339)
-	}
-
-	// Add relevant labels
-	update.Labels["app.kubernetes.io/name"] = build.Spec.AppName
-	update.Labels["build.shapeblock.io/id"] = build.Name
-
-	r.WebsocketClient.SendStatus(update)
 }
 
 type WebsocketClient struct {
@@ -252,6 +227,27 @@ func (w *WebsocketClient) SendStatus(update StatusUpdate) {
 	default:
 		// Queue is full, log warning
 		log.Printf("Message queue full, dropping status update for %s/%s", update.Namespace, update.Name)
+	}
+}
+
+func (w *WebsocketClient) SendBuildLog(buildID string, log string) {
+	msg := BuildLogMessage{
+		Type:    "BUILD_LOG",
+		BuildID: buildID,
+		Log:     log,
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("Failed to marshal build log: %v", err)
+		return
+	}
+
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.conn != nil {
+		w.conn.WriteMessage(websocket.TextMessage, data)
 	}
 }
 

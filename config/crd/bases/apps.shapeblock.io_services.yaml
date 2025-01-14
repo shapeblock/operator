@@ -1,6 +1,9 @@
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: services.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -11,60 +14,7 @@ spec:
     singular: service
   scope: Namespaced
   versions:
-  - name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        properties:
-          spec:
-            properties:
-              appName:
-                type: string
-              chart:
-                type: object
-                required: ["name"]
-                properties:
-                  name:
-                    type: string
-                  version:
-                    type: string
-                  repo:
-                    type: string
-                  repoURL:
-                    type: string
-              image:
-                properties:
-                  repository:
-                    type: string
-                  tag:
-                    type: string
-                  pullPolicy:
-                    type: string
-                required:
-                - repository
-                - tag
-                type: object
-              helmValues:
-                type: object
-                x-kubernetes-preserve-unknown-fields: true
-            required:
-            - appName
-            - chart
-            type: object
-          status:
-            properties:
-              phase:
-                type: string
-              message:
-                type: string
-              helmRelease:
-                type: string
-            type: object
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
-    additionalPrinterColumns:
+  - additionalPrinterColumns:
     - jsonPath: .spec.appName
       name: App
       type: string
@@ -77,3 +27,94 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Service is the Schema for the services API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ServiceSpec defines the desired state of Service
+            properties:
+              appName:
+                description: AppName is the name of the application
+                type: string
+              chart:
+                description: Chart configuration
+                properties:
+                  name:
+                    description: Name of the chart
+                    type: string
+                  repo:
+                    description: Predefined repository name (e.g., "bitnami", "stable")
+                    type: string
+                  repoURL:
+                    description: Custom repository URL
+                    type: string
+                  version:
+                    description: Version of the chart
+                    type: string
+                required:
+                - name
+                type: object
+              helmValues:
+                description: Raw helm values to be passed to the chart
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              image:
+                description: Image configuration
+                properties:
+                  pullPolicy:
+                    type: string
+                  repository:
+                    type: string
+                  tag:
+                    type: string
+                required:
+                - repository
+                - tag
+                type: object
+            required:
+            - appName
+            - chart
+            - image
+            type: object
+          status:
+            description: ServiceStatus defines the observed state of Service
+            properties:
+              helmRelease:
+                description: Name of the Helm release
+                type: string
+              message:
+                description: Human-readable message indicating details about current
+                  phase
+                type: string
+              phase:
+                description: 'Current phase of the service: Pending, Deploying, Deployed,
+                  Failed'
+                type: string
+              url:
+                description: URL where the service is accessible
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

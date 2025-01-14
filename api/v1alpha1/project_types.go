@@ -20,26 +20,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // ProjectSpec defines the desired state of Project
 type ProjectSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Name is the name of the namespace to create
+	Name string `json:"name"`
 
-	// Foo is an example field of Project. Edit project_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// DisplayName is the human-readable name of the project
+	DisplayName string `json:"displayName,omitempty"`
+
+	// Description of the project
+	Description string `json:"description,omitempty"`
+
+	// RegistrySecret references a secret containing registry credentials
+	RegistrySecret string `json:"registrySecret,omitempty"`
 }
 
 // ProjectStatus defines the observed state of Project
 type ProjectStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Current phase of the project
+	Phase string `json:"phase,omitempty"`
+
+	// Human-readable message
+	Message string `json:"message,omitempty"`
+
+	// Last time the status was updated
+	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
 }
 
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
+//+kubebuilder:object:root=true
+//+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="Display Name",type="string",JSONPath=".spec.displayName"
+//+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
+//+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Project is the Schema for the projects API
 type Project struct {
@@ -50,7 +62,7 @@ type Project struct {
 	Status ProjectStatus `json:"status,omitempty"`
 }
 
-// +kubebuilder:object:root=true
+//+kubebuilder:object:root=true
 
 // ProjectList contains a list of Project
 type ProjectList struct {
