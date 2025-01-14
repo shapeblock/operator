@@ -1,0 +1,27 @@
+# permissions for end users to edit projects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: op2
+    app.kubernetes.io/managed-by: kustomize
+  name: project-editor-role
+rules:
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - projects
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - projects/status
+  verbs:
+  - get
