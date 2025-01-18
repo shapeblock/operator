@@ -1,0 +1,26 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: op2
+  name: sb-app-editor-role
+rules:
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - apps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.shapeblock.io
+  resources:
+  - apps/status
+  verbs:
+  - get

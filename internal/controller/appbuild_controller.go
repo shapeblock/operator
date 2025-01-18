@@ -32,8 +32,7 @@ import (
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"bytes"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
@@ -44,6 +43,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 )
+
+var DEBUG = os.Getenv("DEBUG") == "true"
+
+const buildFinalizer = "apps.shapeblock.io/build-cleanup"
 
 // AppBuildReconciler reconciles a AppBuild object
 type AppBuildReconciler struct {
@@ -67,11 +70,25 @@ type AppBuildReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
 
 	// Get AppBuild
 	build := &appsv1alpha1.AppBuild{}
 	if err := r.Get(ctx, req.NamespacedName, build); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Handle deletion
+	if !build.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, build)
+	}
+
+	// Add finalizer if it doesn't exist
+	if !controllerutil.ContainsFinalizer(build, buildFinalizer) {
+		controllerutil.AddFinalizer(build, buildFinalizer)
+		if err := r.Update(ctx, build); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Get referenced App
@@ -80,17 +97,37 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		Namespace: build.Namespace,
 		Name:      build.Spec.AppName,
 	}, app); err != nil {
+		log.Error(err, "Unable to fetch App",
+			"appName", build.Spec.AppName,
+			"buildName", build.Name)
 		return r.failBuild(ctx, build, fmt.Sprintf("unable to fetch App %s: %v", build.Spec.AppName, err))
 	}
 
 	// Initialize build status if not set
 	if build.Status.Phase == "" {
-		build.Status.Phase = "Pending"
-		build.Status.StartTime = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, build); err != nil {
+		// Create a copy of the build object
+		buildCopy := build.DeepCopy()
+		buildCopy.Status.Phase = "Pending"
+		buildCopy.Status.StartTime = &metav1.Time{Time: time.Now()}
+
+		// Use Patch instead of Update
+		if err := r.Status().Patch(ctx, buildCopy, client.MergeFrom(build)); err != nil {
+			if errors.IsConflict(err) {
+				log.Info("Conflict updating build status, will retry",
+					"buildName", build.Name)
+				return ctrl.Result{Requeue: true}, nil
+			}
 			return ctrl.Result{}, err
 		}
-		r.sendBuildStatus(build)
+
+		log.Info("Initializing new build",
+			"buildName", build.Name,
+			"appName", app.Name,
+			"buildType", app.Spec.Build.Type)
+		r.sendBuildStatus(buildCopy)
+
+		// Requeue to handle the rest of the reconciliation
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Check if build is already completed
@@ -101,37 +138,58 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Check for existing build pod/job
 	switch app.Spec.Build.Type {
 	case "dockerfile":
+		log.Info("Processing Dockerfile build",
+			"buildName", build.Name,
+			"appName", app.Name)
 		result, err := r.monitorDockerfileBuild(ctx, app, build)
 		if err != nil {
 			return result, err
 		}
 		if build.Status.Phase == "Completed" {
-			// Create or update Helm release after successful build
+			log.Info("Build completed, creating Helm release",
+				"buildName", build.Name,
+				"appName", app.Name)
+
+			if DEBUG {
+				helmValues, _ := json.MarshalIndent(build.Spec.HelmValues, "", "  ")
+				log.Info("Helm values", "values", string(helmValues))
+			}
+
 			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+				log.Error(err, "Failed to create Helm release")
 				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
 			}
-			// Monitor helm release
 			return r.monitorHelmRelease(ctx, app, build)
 		}
 		return result, nil
 
 	case "buildpack":
+		if build.Status.Phase == "Pending" {
+			log.Info("Starting buildpack build",
+				"buildName", build.Name,
+				"appName", app.Name,
+				"builderImage", app.Spec.Build.BuilderImage)
+		}
 		result, err := r.monitorBuildpackBuild(ctx, app, build)
 		if err != nil {
 			return result, err
 		}
 		if build.Status.Phase == "Completed" {
-			// Create or update Helm release after successful build
 			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
-				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
+				log.Error(err, "Failed to create Helm release")
+				// Requeue to retry Helm release creation
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
-			// Monitor helm release
 			return r.monitorHelmRelease(ctx, app, build)
 		}
 		return result, nil
 
 	case "image":
-		// For image type, skip build and go straight to Helm deployment
+		log.Info("Processing pre-built image deployment",
+			"buildName", build.Name,
+			"appName", app.Name,
+			"image", app.Spec.Build.Image)
+
 		if build.Status.Phase == "" {
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Deploying pre-built image"
@@ -141,15 +199,22 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			r.sendBuildStatus(build)
 
-			// Create or update Helm release with the pre-built image
+			if DEBUG {
+				helmValues, _ := json.MarshalIndent(build.Spec.HelmValues, "", "  ")
+				log.Info("Helm values", "values", string(helmValues))
+			}
+
 			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+				log.Error(err, "Failed to create Helm release")
 				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
 			}
 		}
-		// Monitor helm release
 		return r.monitorHelmRelease(ctx, app, build)
 
 	default:
+		log.Error(nil, "Unsupported build type",
+			"buildType", app.Spec.Build.Type,
+			"buildName", build.Name)
 		return r.failBuild(ctx, build, fmt.Sprintf("unsupported build type: %s", app.Spec.Build.Type))
 	}
 }
@@ -157,7 +222,7 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{
-		Name:      fmt.Sprintf("%s-build-%s", app.Name, build.Name),
+		Name:      build.Name,
 		Namespace: build.Namespace,
 	}, pod)
 
@@ -177,9 +242,12 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 }
 
 func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Get the build job
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{
-		Name:      fmt.Sprintf("%s-build-%s", app.Name, build.Name),
+		Name:      build.Name,
 		Namespace: build.Namespace,
 	}, job)
 
@@ -198,7 +266,9 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods,
 		client.InNamespace(build.Namespace),
-		client.MatchingLabels{"build.shapeblock.io/id": build.Name}); err != nil {
+		client.MatchingLabels{
+			"job-name": build.Name,
+		}); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -206,8 +276,66 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// Update status based on pod phase
-	return r.updateBuildStatus(ctx, build, &pods.Items[0])
+	pod := &pods.Items[0]
+
+	// Update status and stream logs when pod is running
+	if pod.Status.Phase == corev1.PodRunning {
+		if build.Status.Phase != "Building" {
+			build.Status.Phase = "Building"
+			build.Status.Message = "Build in progress"
+			build.Status.PodName = pod.Name
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Start streaming logs
+			go r.streamLogsToWebsocket(ctx, build, pod)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Check if job completed
+	if job.Status.Succeeded > 0 {
+		// Get final logs if we haven't already
+		if build.Status.Phase != "Completed" {
+			// Stream final logs synchronously to ensure we capture everything
+			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
+				log.Error(err, "Failed to capture final logs")
+			}
+
+			build.Status.Phase = "Completed"
+			build.Status.Message = "Build completed successfully"
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Build completed successfully",
+				"buildName", build.Name,
+				"appName", app.Name)
+
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Check if job failed
+	if job.Status.Failed > 0 {
+		if build.Status.Phase != "Failed" {
+			// Stream final logs synchronously to capture failure details
+			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
+				log.Error(err, "Failed to capture final logs")
+			}
+
+			build.Status.Phase = "Failed"
+			build.Status.Message = "Build failed"
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv1alpha1.AppBuild, pod *corev1.Pod) (ctrl.Result, error) {
@@ -254,6 +382,11 @@ func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv
 }
 
 func (r *AppBuildReconciler) streamLogsToWebsocket(ctx context.Context, build *appsv1alpha1.AppBuild, pod *corev1.Pod) {
+	// Skip if either client is not configured
+	if r.WebsocketClient == nil || r.CoreV1Client == nil {
+		return
+	}
+
 	req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 		Follow: true,
 	})
@@ -280,27 +413,6 @@ func (r *AppBuildReconciler) streamLogsToWebsocket(ctx context.Context, build *a
 		// Send log line to websocket channel identified by build ID
 		r.WebsocketClient.SendBuildLog(build.Name, string(line))
 	}
-}
-
-func (r *AppBuildReconciler) getPodLogs(ctx context.Context, pod *corev1.Pod) (string, error) {
-	req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-		Follow:   false,
-		Previous: false,
-	})
-
-	podLogs, err := req.Stream(ctx)
-	if err != nil {
-		return "", fmt.Errorf("error opening log stream: %v", err)
-	}
-	defer podLogs.Close()
-
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, podLogs)
-	if err != nil {
-		return "", fmt.Errorf("error reading logs: %v", err)
-	}
-
-	return buf.String(), nil
 }
 
 func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
@@ -348,11 +460,21 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 }
 
 func (r *AppBuildReconciler) failBuild(ctx context.Context, build *appsv1alpha1.AppBuild, message string) (ctrl.Result, error) {
-	build.Status.Phase = "Failed"
-	build.Status.Message = message
-	build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+	log := ctrl.LoggerFrom(ctx)
 
-	if err := r.Status().Update(ctx, build); err != nil {
+	// Create a copy of the build object
+	buildCopy := build.DeepCopy()
+	buildCopy.Status.Phase = "Failed"
+	buildCopy.Status.Message = message
+	buildCopy.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+
+	// Use Patch instead of Update
+	if err := r.Status().Patch(ctx, buildCopy, client.MergeFrom(build)); err != nil {
+		if errors.IsConflict(err) {
+			log.Info("Conflict updating build status, will retry",
+				"buildName", build.Name)
+			return ctrl.Result{Requeue: true}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -360,6 +482,7 @@ func (r *AppBuildReconciler) failBuild(ctx context.Context, build *appsv1alpha1.
 }
 
 func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
+	log := ctrl.LoggerFrom(ctx)
 
 	// Ensure build cache exists
 	if err := r.ensureBuildCache(ctx, app); err != nil {
@@ -368,7 +491,7 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-build-%s", app.Name, build.Name),
+			Name:      build.Name,
 			Namespace: build.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      app.Name,
@@ -428,7 +551,13 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 								"-report=/layers/report.toml",
 								"-skip-restore=false",
 								fmt.Sprintf("-cache-image=%s/%s-cache:latest", app.Spec.Registry.URL, app.Name),
-								fmt.Sprintf("%s/%s:%s", app.Spec.Registry.URL, app.Name, build.Spec.ImageTag),
+								fmt.Sprintf("%s/%s/%s:%s", app.Spec.Registry.URL, app.Namespace, app.Name, build.Spec.ImageTag),
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "CNB_PLATFORM_API",
+									Value: "0.12",
+								},
 							},
 							VolumeMounts: r.getBuildpackVolumeMounts(),
 						},
@@ -472,7 +601,21 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 		)
 	}
 
-	return r.Create(ctx, job)
+	// Use Create instead of CreateOrPatch for job creation
+	if err := r.Create(ctx, job); err != nil {
+		if errors.IsAlreadyExists(err) {
+			log.Info("Build job already exists, skipping creation",
+				"job", build.Name,
+				"namespace", build.Namespace)
+			return nil
+		}
+		log.Error(err, "Failed to create build job",
+			"jobName", job.Name,
+			"namespace", job.Namespace)
+		return err
+	}
+
+	return nil
 }
 
 func (r *AppBuildReconciler) getBuildpackVolumeMounts() []corev1.VolumeMount {
@@ -605,8 +748,40 @@ func (r *AppBuildReconciler) ensureBuildCache(ctx context.Context, app *appsv1al
 	return nil
 }
 
+// CreateOrPatch creates or patches a Kubernetes object using server-side apply
+func (r *AppBuildReconciler) CreateOrPatch(ctx context.Context, obj client.Object, mutate func() error) error {
+	// Get the current state of the object
+	key := client.ObjectKeyFromObject(obj)
+	current := obj.DeepCopyObject().(client.Object)
+
+	err := r.Get(ctx, key, current)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		// Object doesn't exist, create it
+		return r.Create(ctx, obj)
+	}
+
+	// Object exists, apply the mutation
+	if err := mutate(); err != nil {
+		return err
+	}
+
+	// Patch the object
+	patch := client.MergeFrom(current)
+	return r.Patch(ctx, obj, patch)
+}
+
 // Add new function for Helm release management
 func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
+	// First try to get existing HelmChart
+	existing := &helmv1.HelmChart{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      app.Name,
+		Namespace: build.Namespace,
+	}, existing)
+
 	// Default values for nxs-universal-chart
 	defaultValues := map[string]interface{}{}
 
@@ -635,22 +810,34 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		return fmt.Errorf("failed to marshal helm values: %v", err)
 	}
 
-	// Create HelmChart CR
 	helmChart := &helmv1.HelmChart{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      app.Name,
 			Namespace: build.Namespace,
 		},
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "helm.cattle.io/v1",
+			Kind:       "HelmChart",
+		},
 		Spec: helmv1.HelmChartSpec{
 			Chart:           "nxs-universal-chart",
-			Version:         "1.0.0",
-			Repo:            "https://registry.nixys.ru/chartrepo/public",
+			Version:         "2.8.1",
+			Repo:            "https://registry.nixys.io/chartrepo/public",
 			TargetNamespace: build.Namespace,
 			ValuesContent:   string(valuesYAML),
 		},
 	}
 
-	return r.Create(ctx, helmChart)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return r.Create(ctx, helmChart)
+		}
+		return err
+	}
+
+	// Update existing chart
+	existing.Spec = helmChart.Spec
+	return r.Update(ctx, existing)
 }
 
 // Helper function to merge maps with deep merge support
@@ -696,6 +883,8 @@ func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
 }
 
 func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
 	helmChart := &helmv1.HelmChart{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
@@ -704,10 +893,16 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 
 	if err != nil {
 		if errors.IsNotFound(err) {
+			log.Info("Waiting for Helm chart to be created",
+				"appName", app.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
+
+	log.Info("Monitoring Helm release",
+		"appName", app.Name,
+		"jobName", helmChart.Status.JobName)
 
 	// Check helm chart status
 	if helmChart.Status.JobName != "" {
@@ -724,8 +919,10 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
-		// Update build status based on helm job status
 		if job.Status.Succeeded > 0 {
+			log.Info("Helm release completed successfully",
+				"appName", app.Name,
+				"buildName", build.Name)
 			build.Status.Message = "Helm release completed successfully"
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
@@ -735,11 +932,69 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		}
 
 		if job.Status.Failed > 0 {
+			log.Error(nil, "Helm release failed",
+				"appName", app.Name,
+				"buildName", build.Name)
 			return r.failBuild(ctx, build, "Helm release failed")
 		}
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+func (r *AppBuildReconciler) handleDeletion(ctx context.Context, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	if controllerutil.ContainsFinalizer(build, buildFinalizer) {
+		// Delete the build job
+		job := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      build.Name,
+			Namespace: build.Namespace,
+		}, job)
+
+		if err == nil {
+			// Job exists, delete it
+			log.Info("Deleting build job",
+				"job", job.Name,
+				"namespace", job.Namespace)
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+				if !errors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			}
+		} else if !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+
+		// Remove finalizer
+		controllerutil.RemoveFinalizer(build, buildFinalizer)
+		if err := r.Update(ctx, build); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *AppBuildReconciler) streamFinalLogs(ctx context.Context, build *appsv1alpha1.AppBuild, pod *corev1.Pod) error {
+	// Skip if either client is not configured
+	if r.WebsocketClient == nil || r.CoreV1Client == nil {
+		return nil
+	}
+
+	req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{})
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	scanner := bufio.NewScanner(stream)
+	for scanner.Scan() {
+		r.WebsocketClient.SendBuildLog(build.Name, scanner.Text()+"\n")
+	}
+	return scanner.Err()
 }
 
 // SetupWithManager sets up the controller with the Manager.

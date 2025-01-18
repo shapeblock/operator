@@ -82,15 +82,29 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			log.Error(err, "Failed to create namespace")
 			return r.failProject(ctx, project, fmt.Sprintf("Failed to create namespace: %v", err))
 		}
+		log.Info("Namespace already exists", "namespace", project.Spec.Name)
+	} else {
+		log.Info("Successfully created namespace",
+			"namespace", project.Spec.Name,
+			"projectId", project.Name)
 	}
 
-	// Copy registry secret if specified
-	if project.Spec.RegistrySecret != "" {
-		if err := r.copyRegistrySecret(ctx, project); err != nil {
-			log.Error(err, "Failed to copy registry secret")
-			return r.failProject(ctx, project, fmt.Sprintf("Failed to copy registry secret: %v", err))
-		}
+	// Copy registry secret - either specified or default
+	registrySecretName := project.Spec.RegistrySecret
+	if registrySecretName == "" {
+		registrySecretName = "registry-creds" // Default secret name
+		log.Info("No registry secret specified, using default",
+			"secretName", registrySecretName)
 	}
+
+	if err := r.copyRegistrySecret(ctx, project, registrySecretName); err != nil {
+		log.Error(err, "Failed to copy registry secret")
+		return r.failProject(ctx, project, fmt.Sprintf("Failed to copy registry secret: %v", err))
+	}
+	log.Info("Successfully copied registry secret",
+		"from", registrySecretName,
+		"to", "registry-creds",
+		"namespace", project.Spec.Name)
 
 	// Update status to Active
 	if project.Status.Phase != "Active" {
@@ -100,24 +114,49 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Status().Update(ctx, project); err != nil {
 			return ctrl.Result{}, err
 		}
+		log.Info("Project is now active",
+			"project", project.Name,
+			"namespace", project.Spec.Name)
 		r.sendProjectStatus(project)
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *appsv1alpha1.Project) error {
+func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *appsv1alpha1.Project, sourceSecretName string) error {
+	log := log.FromContext(ctx)
+
+	// Check if secret already exists in target namespace
+	existingSecret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      "registry-creds",
+		Namespace: project.Spec.Name,
+	}, existingSecret)
+
+	if err == nil {
+		log.Info("Registry secret already exists in namespace, skipping copy",
+			"namespace", project.Spec.Name,
+			"secretName", "registry-creds")
+		return nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return err
+	}
+
+	// Get source secret
 	sourceSecret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      project.Spec.RegistrySecret,
+		Name:      sourceSecretName,
 		Namespace: "shapeblock",
 	}, sourceSecret); err != nil {
 		return err
 	}
 
+	// Create new secret
 	newSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "registry-credentials",
+			Name:      "registry-creds",
 			Namespace: project.Spec.Name,
 			Labels: map[string]string{
 				"shapeblock.io/project-id": project.Name,

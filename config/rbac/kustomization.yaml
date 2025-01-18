@@ -28,4 +28,6 @@ resources:
 - appbuild_viewer_role.yaml
 - project_editor_role.yaml
 - project_viewer_role.yaml
+- app_editor_role.yaml
+- app_viewer_role.yaml
 

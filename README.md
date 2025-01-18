@@ -154,6 +154,7 @@ kind: Project
 metadata:
   name: my-project
 spec:
+  name: "my-project"
   displayName: "My Project"
   description: "A sample project"
 ```

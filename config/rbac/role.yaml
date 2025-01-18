@@ -7,6 +7,7 @@ rules:
 - apiGroups:
   - apps.shapeblock.io
   resources:
+  - apps
   - appbuilds
   - projects
   - services
@@ -21,6 +22,7 @@ rules:
 - apiGroups:
   - apps.shapeblock.io
   resources:
+  - apps/finalizers
   - appbuilds/finalizers
   - projects/finalizers
   verbs:
@@ -28,6 +30,7 @@ rules:
 - apiGroups:
   - apps.shapeblock.io
   resources:
+  - apps/status
   - appbuilds/status
   - projects/status
   - services/status
@@ -40,14 +43,30 @@ rules:
   resources:
   - jobs
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - ""
   resources:
   - namespaces
   - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
   verbs:
   - create
   - delete
@@ -67,4 +86,13 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - pods/log
+  verbs:
+  - get
+  - list
   - watch

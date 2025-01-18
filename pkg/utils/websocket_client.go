@@ -1,9 +1,11 @@
 package utils
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -66,6 +68,7 @@ type WebsocketClient struct {
 	messageQueue chan StatusUpdate
 	mu           sync.RWMutex // Protects conn
 	isConnected  bool
+	lastPong     time.Time
 }
 
 func NewWebsocketClient(serverURL, apiKey string) (*WebsocketClient, error) {
@@ -137,6 +140,14 @@ func (w *WebsocketClient) connect() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		// Add TLS configuration if needed
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
 	u, err := url.Parse(w.serverURL)
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %v", err)
@@ -147,14 +158,33 @@ func (w *WebsocketClient) connect() error {
 	q.Set("api_key", w.apiKey)
 	u.RawQuery = q.Encode()
 
-	// Connect to WebSocket server
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	// Connect with custom headers
+	headers := http.Header{}
+	headers.Add("User-Agent", "ShapeBlock-Operator/1.0")
+
+	conn, resp, err := dialer.Dial(u.String(), headers)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("failed to connect (status %d): %v", resp.StatusCode, err)
+		}
 		return fmt.Errorf("failed to connect: %v", err)
 	}
 
+	// Configure WebSocket connection
+	conn.SetPingHandler(func(data string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+	})
+
+	conn.SetPongHandler(func(string) error {
+		w.mu.Lock()
+		w.lastPong = time.Now()
+		w.mu.Unlock()
+		return nil
+	})
+
 	w.conn = conn
 	w.isConnected = true
+	w.lastPong = time.Now()
 	return nil
 }
 
@@ -168,7 +198,21 @@ func (w *WebsocketClient) heartbeat(ticker *time.Ticker, done chan struct{}) {
 				close(done)
 				return
 			}
-			err := w.conn.WriteMessage(websocket.PingMessage, nil)
+
+			// Check last pong time
+			if time.Since(w.lastPong) > time.Minute {
+				log.Printf("No pong received for 1 minute, reconnecting...")
+				w.mu.RUnlock()
+				w.closeConnection()
+				close(done)
+				return
+			}
+
+			err := w.conn.WriteControl(
+				websocket.PingMessage,
+				[]byte{},
+				time.Now().Add(10*time.Second),
+			)
 			w.mu.RUnlock()
 
 			if err != nil {
@@ -177,6 +221,7 @@ func (w *WebsocketClient) heartbeat(ticker *time.Ticker, done chan struct{}) {
 				close(done)
 				return
 			}
+
 		case <-w.done:
 			return
 		}

@@ -1,13 +1,14 @@
 package license
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -126,30 +127,41 @@ func (v *Validator) activateLicense(licenseID string) error {
 func (v *Validator) makeRequest(method, url string, payload interface{}) (map[string]interface{}, error) {
 	var req *http.Request
 	var err error
+	var reqBody io.Reader
 
 	if payload != nil {
 		payloadBytes, err := json.Marshal(payload)
 		if err != nil {
 			return nil, err
 		}
-		req, err = http.NewRequest(method, url, strings.NewReader(string(payloadBytes)))
-	} else {
-		req, err = http.NewRequest(method, url, nil)
+		reqBody = bytes.NewReader(payloadBytes)
 	}
+
+	req, err = http.NewRequest(method, url, reqBody)
 
 	if err != nil {
 		return nil, err
 	}
 
+	// Let's add some debug logging
+	fmt.Printf("Request URL: %s\n", url)
+	fmt.Printf("Request Headers: %+v\n", req.Header)
+	fmt.Printf("Request Payload: %+v\n", payload)
+
 	req.Header.Set("Content-Type", "application/vnd.api+json")
 	req.Header.Set("Accept", "application/vnd.api+json")
-	req.Header.Set("Authorization", "Bearer "+v.licenseKey)
+	req.Header.Set("Authorization", "License "+v.licenseKey)
 
 	resp, err := v.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// Add response debug logging
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("Response Status: %d\n", resp.StatusCode)
+	fmt.Printf("Response Body: %s\n", string(body))
 
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)

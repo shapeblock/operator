@@ -1,9 +1,7 @@
 apiVersion: apps.shapeblock.io/v1alpha1
 kind: Project
 metadata:
-  labels:
-    app.kubernetes.io/name: op2
-    app.kubernetes.io/managed-by: kustomize
-  name: project-sample
+  name: my-project
 spec:
-  # TODO(user): Add fields here
+  name: "my-project"
+  description: "A sample project"

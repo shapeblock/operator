@@ -92,6 +92,8 @@ spec:
             cpu: 10m
             memory: 64Mi
         env:
+        - name: DEBUG
+          value: "true"
         - name: SHAPEBLOCK_WS_URL
           value: "wss://your-shapeblock-server/ws"
         - name: SHAPEBLOCK_API_KEY
@@ -99,5 +101,15 @@ spec:
             secretKeyRef:
               name: shapeblock-credentials
               key: api-key
+        - name: SHAPEBLOCK_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shapeblock-credentials
+              key: license-key
+        - name: SHAPEBLOCK_LICENSE_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: shapeblock-credentials
+              key: license-email
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

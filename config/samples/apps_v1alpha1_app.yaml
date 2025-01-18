@@ -1,0 +1,20 @@
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: App
+metadata:
+  name: fl4
+  namespace: my-project
+spec:
+  displayName: "Sample Application"
+  description: "A sample application to demonstrate the App CR"
+
+  build:
+    type: "buildpack"
+    builderImage: "paketobuildpacks/builder-jammy-full:0.3.440"
+
+  git:
+    url: "https://github.com/badri/flask.git"
+    branch: "main"
+
+  registry:
+    url: "registry.without-op.shapeblockapp.com"
+    secretName: "registry-creds"

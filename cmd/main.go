@@ -24,6 +24,9 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
+	v1 "k8s.io/api/apps/v1"
+	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,7 +41,6 @@ import (
 
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
 	"github.com/shapeblock/operator/internal/controller"
-	"github.com/shapeblock/operator/pkg/license"
 	"github.com/shapeblock/operator/pkg/utils"
 	// +kubebuilder:scaffold:imports
 )
@@ -52,6 +54,8 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(appsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(v1.AddToScheme(scheme))
+	utilruntime.Must(helmv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -147,6 +151,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Get license details from environment
+	licenseKey := os.Getenv("SHAPEBLOCK_LICENSE_KEY")
+	licenseEmail := os.Getenv("SHAPEBLOCK_LICENSE_EMAIL")
+	if licenseKey == "" || licenseEmail == "" {
+		setupLog.Error(fmt.Errorf("SHAPEBLOCK_LICENSE_KEY and SHAPEBLOCK_LICENSE_EMAIL must be set"), "")
+		os.Exit(1)
+	}
+
+	// Initialize websocket client
+	wsClient, err := utils.NewWebsocketClient(
+		os.Getenv("SHAPEBLOCK_WS_URL"),
+		os.Getenv("SHAPEBLOCK_API_KEY"),
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create websocket client")
+		os.Exit(1)
+	}
+	defer wsClient.Close()
+
 	if err = (&controller.ProjectReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -155,8 +178,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&controller.AppBuildReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		WebsocketClient: wsClient,
+		CoreV1Client:    kubernetes.NewForConfigOrDie(ctrl.GetConfigOrDie()).CoreV1(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AppBuild")
 		os.Exit(1)
@@ -166,6 +191,15 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Service")
+		os.Exit(1)
+	}
+	if err = (&controller.AppReconciler{
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		WebsocketClient: wsClient,
+		GitClient:       utils.NewGitClient(os.Getenv("SHAPEBLOCK_API_URL"), os.Getenv("SHAPEBLOCK_API_KEY")),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "App")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
@@ -178,36 +212,6 @@ func main() {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
-
-	// Get license details from environment
-	licenseKey := os.Getenv("SHAPEBLOCK_LICENSE_KEY")
-	licenseEmail := os.Getenv("SHAPEBLOCK_LICENSE_EMAIL")
-	if licenseKey == "" || licenseEmail == "" {
-		setupLog.Error(fmt.Errorf("SHAPEBLOCK_LICENSE_KEY and SHAPEBLOCK_LICENSE_EMAIL must be set"), "")
-		os.Exit(1)
-	}
-
-	// Validate license
-	validator, err := license.NewValidator(licenseKey, licenseEmail)
-	if err != nil {
-		setupLog.Error(err, "invalid license configuration")
-		os.Exit(1)
-	}
-
-	if err := validator.ValidateAndActivate(); err != nil {
-		setupLog.Error(err, "license validation failed")
-		os.Exit(1)
-	}
-
-	wsClient, err := utils.NewWebsocketClient(
-		os.Getenv("SHAPEBLOCK_WS_URL"),
-		os.Getenv("SHAPEBLOCK_API_KEY"),
-	)
-	if err != nil {
-		setupLog.Error(err, "unable to create websocket client")
-		os.Exit(1)
-	}
-	defer wsClient.Close()
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

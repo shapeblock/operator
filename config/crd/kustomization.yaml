@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/apps.shapeblock.io_projects.yaml
+- bases/apps.shapeblock.io_apps.yaml
 - bases/apps.shapeblock.io_appbuilds.yaml
 - bases/apps.shapeblock.io_services.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
