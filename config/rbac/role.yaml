@@ -88,6 +88,20 @@ rules:
   - update
   - watch
 - apiGroups:
+  - helm.cattle.io
+  resources:
+  - helmchartversions
+  - helmchartversions/finalizers
+  - helmchartversions/status
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - ""
   resources:
   - pods

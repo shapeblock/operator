@@ -5,14 +5,18 @@ import (
 	"fmt"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
 	"github.com/shapeblock/operator/pkg/utils"
 )
@@ -30,6 +34,10 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	app := &appsv1alpha1.App{}
 	if err := r.Get(ctx, req.NamespacedName, app); err != nil {
+		if errors.IsNotFound(err) {
+			// App was deleted, clean up resources
+			return r.handleDeletion(ctx, req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -164,6 +172,70 @@ func (r *AppReconciler) failApp(ctx context.Context, app *appsv1alpha1.App, mess
 	if err := r.Status().Update(ctx, app); err != nil {
 		return ctrl.Result{}, err
 	}
+	return ctrl.Result{}, nil
+}
+
+func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types.NamespacedName) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	// 1. Delete all jobs with the label app.kubernetes.io/name: <app-name>
+	jobList := &batchv1.JobList{}
+	labelSelector := labels.SelectorFromSet(map[string]string{
+		"app.kubernetes.io/name": namespacedName.Name,
+	})
+	if err := r.List(ctx, jobList, &client.ListOptions{
+		Namespace:     namespacedName.Namespace,
+		LabelSelector: labelSelector,
+	}); err != nil {
+		log.Error(err, "Failed to list jobs")
+		return ctrl.Result{}, err
+	}
+
+	for _, job := range jobList.Items {
+		if err := r.Delete(ctx, &job); err != nil {
+			log.Error(err, "Failed to delete job", "job", job.Name)
+			return ctrl.Result{}, err
+		}
+		log.Info("Deleted job", "job", job.Name)
+	}
+
+	// 2. Delete the HelmChart CR
+	helmChart := &helmv1.HelmChart{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      namespacedName.Name,
+		Namespace: namespacedName.Namespace,
+	}, helmChart); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Error(err, "Failed to get HelmChart")
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := r.Delete(ctx, helmChart); err != nil {
+			log.Error(err, "Failed to delete HelmChart")
+			return ctrl.Result{}, err
+		}
+		log.Info("Deleted HelmChart", "name", helmChart.Name)
+	}
+
+	// 3. Delete the cache PVC
+	pvc := &corev1.PersistentVolumeClaim{}
+	pvcName := fmt.Sprintf("cache-%s", namespacedName.Name)
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      pvcName,
+		Namespace: namespacedName.Namespace,
+	}, pvc); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Error(err, "Failed to get cache PVC")
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := r.Delete(ctx, pvc); err != nil {
+			log.Error(err, "Failed to delete cache PVC")
+			return ctrl.Result{}, err
+		}
+		log.Info("Deleted cache PVC", "name", pvc.Name)
+	}
+
 	return ctrl.Result{}, nil
 }
 
