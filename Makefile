@@ -50,7 +50,7 @@ endif
 # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
 OPERATOR_SDK_VERSION ?= v1.39.0
 # Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/shapeblock/operator:v3.18
+IMG ?= ghcr.io/shapeblock/operator:v3.35
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.31.0

@@ -2,8 +2,26 @@ apiVersion: apps.shapeblock.io/v1alpha1
 kind: Service
 metadata:
   labels:
-    app.kubernetes.io/name: op2
-    app.kubernetes.io/managed-by: kustomize
-  name: service-sample
+    app.kubernetes.io/name: redis-app
+    app.kubernetes.io/managed-by: shapeblock-operator
+  name: redis
+  namespace: my-project
 spec:
-  # TODO(user): Add fields here
+  appName: redis-app
+  chart:
+    name: redis
+    version: "17.15.4"
+    repoURL: "https://charts.bitnami.com/bitnami"
+  image:
+    repository: bitnami/redis
+    tag: "7.2.4"
+    pullPolicy: IfNotPresent
+  helmValues:
+    architecture: standalone
+    auth:
+      enabled: true
+      password: "redis123"
+    master:
+      persistence:
+        enabled: true
+        size: 8Gi

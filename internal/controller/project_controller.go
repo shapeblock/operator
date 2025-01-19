@@ -58,12 +58,11 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Initialize status if not set
 	if project.Status.Phase == "" {
-		project.Status.Phase = "Initializing"
-		project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, project); err != nil {
+		if err := r.updateProjectStatus(ctx, project, "Initializing", ""); err != nil {
 			return ctrl.Result{}, err
 		}
-		r.sendProjectStatus(project)
+		// Requeue to continue with the rest of the reconciliation
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Create namespace if it doesn't exist
@@ -106,21 +105,37 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		"to", "registry-creds",
 		"namespace", project.Spec.Name)
 
-	// Update status to Active
+	// Update status to Active if not already
 	if project.Status.Phase != "Active" {
-		project.Status.Phase = "Active"
-		project.Status.Message = "Project setup completed"
-		project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, project); err != nil {
+		if err := r.updateProjectStatus(ctx, project, "Active", "Project setup completed"); err != nil {
 			return ctrl.Result{}, err
 		}
-		log.Info("Project is now active",
-			"project", project.Name,
-			"namespace", project.Spec.Name)
-		r.sendProjectStatus(project)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// updateProjectStatus updates the status of the Project resource
+func (r *ProjectReconciler) updateProjectStatus(ctx context.Context, project *appsv1alpha1.Project, phase, message string) error {
+	// Get the latest version of the Project
+	latest := &appsv1alpha1.Project{}
+	if err := r.Get(ctx, types.NamespacedName{Name: project.Name, Namespace: project.Namespace}, latest); err != nil {
+		return err
+	}
+
+	// Update status fields
+	latest.Status.Phase = phase
+	if message != "" {
+		latest.Status.Message = message
+	}
+	latest.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+
+	// Update status and send websocket notification
+	if err := r.Status().Update(ctx, latest); err != nil {
+		return err
+	}
+	r.sendProjectStatus(latest)
+	return nil
 }
 
 func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *appsv1alpha1.Project, sourceSecretName string) error {
@@ -171,13 +186,9 @@ func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *app
 }
 
 func (r *ProjectReconciler) failProject(ctx context.Context, project *appsv1alpha1.Project, message string) (ctrl.Result, error) {
-	project.Status.Phase = "Failed"
-	project.Status.Message = message
-	project.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-	if err := r.Status().Update(ctx, project); err != nil {
+	if err := r.updateProjectStatus(ctx, project, "Failed", message); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.sendProjectStatus(project)
 	return ctrl.Result{}, fmt.Errorf(message)
 }
 

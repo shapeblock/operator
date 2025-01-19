@@ -1,0 +1,69 @@
+apiVersion: apps.shapeblock.io/v1alpha1
+kind: AppBuild
+metadata:
+  name: fl4-build-3
+  namespace: py-dev
+spec:
+  appName: "fl4"
+  gitRef: "main"
+  imageTag: "v1"
+
+  helmValues:
+    defaultImageTag: "v1"
+    releasePrefix: "fl4"
+
+    deployments:
+      python:
+        containers:
+          - name: python
+            envConfigmaps:
+              - envs
+            livenessProbe:
+              tcpSocket:
+                port: 8080
+            ports:
+              - containerPort: 8080
+                name: app
+            resources:
+              limits:
+                cpu: "1"
+                memory: 2Gi
+              requests:
+                cpu: 5m
+                memory: 128M
+        podLabels:
+          release: fl4
+        replicas: 1
+
+    envs:
+      PORT: "8080"
+
+    generic:
+      extraImagePullSecrets:
+        - name: registry-creds
+      labels:
+        release: fl4
+      usePredefinedAffinity: false
+
+    ingresses:
+      "py-dev-fl4.without-op.shapeblockapp.com":
+        annotations:
+          nginx.ingress.kubernetes.io/proxy-body-size: 50m
+          nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        certManager:
+          originalIssuerName: letsencrypt-prod
+          issuerType: cluster-issuer
+        hosts:
+          - paths:
+              - serviceName: python
+                servicePort: 8080
+        ingressClassName: nginx
+        name: my-project
+
+    services:
+      python:
+        extraSelectorLabels:
+          release: fl4
+        ports:
+          - port: 8080
+        type: NodePort

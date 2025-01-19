@@ -285,3 +285,15 @@ status:
 ```
 
 Handles the build process.
+
+# TODOs
+- [ ] identify patchable fields in app and appbuild CR
+- [x] service CR
+- [ ] test dockerfile build
+- [x] test buildpack build
+- [ ] test pre-built image build
+- [ ] identify and optimize websocket flow
+- [ ] previous image as status field for App CR
+- [ ] test private repo creation(and deletion)
+- [ ] service backup and restore CRs(?)
+- [ ] create a github action for the build

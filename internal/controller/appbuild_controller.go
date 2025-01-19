@@ -130,11 +130,6 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Check if build is already completed
-	if build.Status.Phase == "Completed" || build.Status.Phase == "Failed" {
-		return ctrl.Result{}, nil
-	}
-
 	// Check for existing build pod/job
 	switch app.Spec.Build.Type {
 	case "dockerfile":
@@ -678,7 +673,12 @@ func (r *AppBuildReconciler) getBuildVolumes(app *appsv1alpha1.App) []corev1.Vol
 			Name: "registry-creds",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: app.Spec.Registry.SecretName,
+					SecretName: func() string {
+						if app.Spec.Registry.SecretName != "" {
+							return app.Spec.Registry.SecretName
+						}
+						return "registry-creds"
+					}(),
 					Items: []corev1.KeyToPath{
 						{
 							Key:  ".dockerconfigjson",
@@ -734,7 +734,7 @@ func (r *AppBuildReconciler) ensureBuildCache(ctx context.Context, app *appsv1al
 			},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("5Gi"),
+					corev1.ResourceStorage: resource.MustParse("3Gi"),
 				},
 			},
 		},
@@ -775,12 +775,36 @@ func (r *AppBuildReconciler) CreateOrPatch(ctx context.Context, obj client.Objec
 
 // Add new function for Helm release management
 func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Validate required fields
+	if app == nil {
+		return fmt.Errorf("app is nil")
+	}
+	if build == nil {
+		return fmt.Errorf("build is nil")
+	}
+	if app.Name == "" {
+		return fmt.Errorf("app name is empty")
+	}
+	if build.Namespace == "" {
+		return fmt.Errorf("build namespace is empty")
+	}
+
 	// First try to get existing HelmChart
 	existing := &helmv1.HelmChart{}
+	log.Info("Attempting to get existing HelmChart",
+		"name", app.Name,
+		"namespace", build.Namespace)
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
 		Namespace: build.Namespace,
 	}, existing)
+
+	log.Info("Get HelmChart result",
+		"error", err,
+		"existing.Name", existing.GetName(),
+		"existing.Namespace", existing.GetNamespace())
 
 	// Default values for nxs-universal-chart
 	defaultValues := map[string]interface{}{}
@@ -791,7 +815,7 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		defaultValues["defaultImage"] = repository
 		defaultValues["defaultImageTag"] = tag
 	} else {
-		defaultValues["defaultImage"] = fmt.Sprintf("%s/%s", app.Spec.Registry.URL, app.Name)
+		defaultValues["defaultImage"] = fmt.Sprintf("%s/%s/%s", app.Spec.Registry.URL, app.Namespace, app.Name)
 		defaultValues["defaultImageTag"] = build.Spec.ImageTag
 	}
 
@@ -811,13 +835,17 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 	}
 
 	helmChart := &helmv1.HelmChart{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      app.Name,
-			Namespace: build.Namespace,
-		},
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "helm.cattle.io/v1",
 			Kind:       "HelmChart",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      app.Name,
+			Namespace: build.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "shapeblock-operator",
+				"app.kubernetes.io/name":       app.Name,
+			},
 		},
 		Spec: helmv1.HelmChartSpec{
 			Chart:           "nxs-universal-chart",
@@ -828,14 +856,26 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		},
 	}
 
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return r.Create(ctx, helmChart)
-		}
-		return err
+	log.Info("Prepared HelmChart object",
+		"name", helmChart.GetName(),
+		"namespace", helmChart.GetNamespace(),
+		"apiVersion", helmChart.APIVersion,
+		"kind", helmChart.Kind)
+
+	// Always create a new HelmChart if the existing one is invalid
+	if err != nil || existing.GetName() == "" || existing.GetNamespace() == "" {
+		log.Info("Creating new HelmChart",
+			"appName", app.Name,
+			"buildName", build.Name,
+			"namespace", build.Namespace,
+			"error", err)
+		return r.Create(ctx, helmChart)
 	}
 
 	// Update existing chart
+	log.Info("Updating existing HelmChart",
+		"name", existing.GetName(),
+		"namespace", existing.GetNamespace())
 	existing.Spec = helmChart.Spec
 	return r.Update(ctx, existing)
 }
@@ -900,26 +940,30 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		return ctrl.Result{}, err
 	}
 
-	log.Info("Monitoring Helm release",
-		"appName", app.Name,
-		"jobName", helmChart.Status.JobName)
+	// If JobName is empty, wait for it to be populated
+	if helmChart.Status.JobName == "" {
+		log.Info("Waiting for helm job to be created",
+			"appName", app.Name)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 
-	// Check helm chart status
-	if helmChart.Status.JobName != "" {
-		job := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      helmChart.Status.JobName,
-			Namespace: build.Namespace,
-		}, job)
+	// Get the helm install/upgrade job
+	job := &batchv1.Job{}
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      helmChart.Status.JobName,
+		Namespace: build.Namespace,
+	}, job)
 
-		if err != nil {
-			if !errors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
+	if err != nil {
+		if errors.IsNotFound(err) {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		return ctrl.Result{}, err
+	}
 
-		if job.Status.Succeeded > 0 {
+	// Check job conditions
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
 			log.Info("Helm release completed successfully",
 				"appName", app.Name,
 				"buildName", build.Name)
@@ -931,11 +975,12 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			return ctrl.Result{}, nil
 		}
 
-		if job.Status.Failed > 0 {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
 			log.Error(nil, "Helm release failed",
 				"appName", app.Name,
-				"buildName", build.Name)
-			return r.failBuild(ctx, build, "Helm release failed")
+				"buildName", build.Name,
+				"message", condition.Message)
+			return r.failBuild(ctx, build, fmt.Sprintf("Helm release failed: %s", condition.Message))
 		}
 	}
 

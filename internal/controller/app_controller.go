@@ -43,30 +43,25 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	// Initialize app status if not set
 	if app.Status.Phase == "" {
-		app.Status.Phase = "Initializing"
-		app.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, app); err != nil {
+		if err := r.updateAppStatus(ctx, app, "Initializing", ""); err != nil {
 			return ctrl.Result{}, err
 		}
 		log.Info("Initializing new app",
 			"app", app.Name,
 			"namespace", app.Namespace,
 			"gitUrl", app.Spec.Git.URL)
+		// Requeue to continue with the rest of the reconciliation
+		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Handle private repository setup
+	// Handle private repository setup if needed
 	if app.Spec.Git.IsPrivate {
 		log.Info("Setting up private repository",
 			"app", app.Name,
 			"namespace", app.Namespace)
-
 		if err := r.setupPrivateRepo(ctx, app); err != nil {
-			log.Error(err, "Failed to setup private repository")
 			return r.failApp(ctx, app, fmt.Sprintf("Failed to setup private repository: %v", err))
 		}
-		log.Info("Successfully setup private repository",
-			"app", app.Name,
-			"secretName", app.Spec.Git.SecretName)
 	}
 
 	// Create or update registry secret
@@ -98,12 +93,9 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 	}
 
-	// Update status to Ready
+	// Update status to Ready if not already
 	if app.Status.Phase != "Ready" {
-		app.Status.Phase = "Ready"
-		app.Status.Message = "Application is ready for builds"
-		app.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, app); err != nil {
+		if err := r.updateAppStatus(ctx, app, "Ready", ""); err != nil {
 			return ctrl.Result{}, err
 		}
 		log.Info("App is now ready",
@@ -113,6 +105,39 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// updateAppStatus updates the status of the App resource
+func (r *AppReconciler) updateAppStatus(ctx context.Context, app *appsv1alpha1.App, phase, message string) error {
+	// Get the latest version of the App
+	latest := &appsv1alpha1.App{}
+	if err := r.Get(ctx, types.NamespacedName{Name: app.Name, Namespace: app.Namespace}, latest); err != nil {
+		return err
+	}
+
+	// Update status fields
+	latest.Status.Phase = phase
+	if message != "" {
+		latest.Status.Message = message
+	}
+	latest.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+
+	// Update status and send websocket notification
+	if err := r.Status().Update(ctx, latest); err != nil {
+		return err
+	}
+	statusUpdate := utils.NewStatusUpdate("App", latest.Name, latest.Namespace)
+	statusUpdate.Status = latest.Status.Phase
+	statusUpdate.Message = latest.Status.Message
+	r.WebsocketClient.SendStatus(statusUpdate)
+	return nil
+}
+
+func (r *AppReconciler) failApp(ctx context.Context, app *appsv1alpha1.App, message string) (ctrl.Result, error) {
+	if err := r.updateAppStatus(ctx, app, "Failed", message); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, fmt.Errorf(message)
 }
 
 func (r *AppReconciler) setupPrivateRepo(ctx context.Context, app *appsv1alpha1.App) error {
@@ -163,16 +188,6 @@ func (r *AppReconciler) setupPrivateRepo(ctx context.Context, app *appsv1alpha1.
 		"secretName", secret.Name)
 
 	return nil
-}
-
-func (r *AppReconciler) failApp(ctx context.Context, app *appsv1alpha1.App, message string) (ctrl.Result, error) {
-	app.Status.Phase = "Failed"
-	app.Status.Message = message
-	app.Status.LastUpdated = &metav1.Time{Time: time.Now()}
-	if err := r.Status().Update(ctx, app); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
 }
 
 func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types.NamespacedName) (ctrl.Result, error) {
