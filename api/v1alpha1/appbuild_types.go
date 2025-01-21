@@ -27,10 +27,12 @@ type AppBuildSpec struct {
 	AppName string `json:"appName"`
 
 	// Git reference to build (commit, branch, tag)
-	GitRef string `json:"gitRef"`
+	// +kubebuilder:validation:Optional
+	GitRef string `json:"gitRef,omitempty"`
 
 	// ImageTag for this specific build
-	ImageTag string `json:"imageTag"`
+	// +kubebuilder:validation:Optional
+	ImageTag string `json:"imageTag,omitempty"`
 
 	// Additional build environment variables
 	BuildVars []BuildVar `json:"buildVars,omitempty"`
@@ -66,13 +68,22 @@ type BuildVar struct {
 // AppBuildStatus defines the observed state of AppBuild
 type AppBuildStatus struct {
 	// Current phase of the build
+	// +kubebuilder:validation:Enum=Pending;Building;Deploying;Completed;Failed
+	// +kubebuilder:default=Pending
 	Phase string `json:"phase,omitempty"`
 
 	// Human-readable message
 	Message string `json:"message,omitempty"`
 
 	// Build pod details for log streaming
+	// Only set for dockerfile and buildpack builds
 	PodName string `json:"podName,omitempty"`
+
+	// Git commit SHA of the code being built
+	GitCommit string `json:"gitCommit,omitempty"`
+
+	// Image tag for the built container
+	ImageTag string `json:"imageTag,omitempty"`
 
 	// Timestamps
 	StartTime      *metav1.Time `json:"startTime,omitempty"`

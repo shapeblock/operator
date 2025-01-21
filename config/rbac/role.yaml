@@ -107,6 +107,7 @@ rules:
   - pods
   - pods/log
   verbs:
+  - create
   - get
   - list
   - watch

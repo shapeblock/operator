@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -59,6 +60,11 @@ type AppBuildReconciler struct {
 // +kubebuilder:rbac:groups=apps.shapeblock.io,resources=appbuilds,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps.shapeblock.io,resources=appbuilds/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps.shapeblock.io,resources=appbuilds/finalizers,verbs=update
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=helm.cattle.io,resources=helmcharts,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -185,7 +191,7 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			"appName", app.Name,
 			"image", app.Spec.Build.Image)
 
-		if build.Status.Phase == "" {
+		if build.Status.Phase == "" || build.Status.Phase == "Pending" {
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Deploying pre-built image"
 			build.Status.StartTime = &metav1.Time{Time: time.Now()}
@@ -215,25 +221,139 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 }
 
 func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
-	pod := &corev1.Pod{}
+	log := ctrl.LoggerFrom(ctx)
+
+	// Get the build job
+	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      build.Name,
 		Namespace: build.Namespace,
-	}, pod)
+	}, job)
 
 	if err != nil {
 		if errors.IsNotFound(err) {
-			// Create new build pod
-			if err := r.handleDockerfileBuild(ctx, app, build); err != nil {
-				return r.failBuild(ctx, build, fmt.Sprintf("failed to create build pod: %v", err))
+			// Only create new job if we're in Pending phase
+			if build.Status.Phase == "Pending" {
+				if err := r.handleDockerfileBuild(ctx, app, build); err != nil {
+					return r.failBuild(ctx, build, fmt.Sprintf("failed to create build job: %v", err))
+				}
 			}
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Update status based on pod phase
-	return r.updateBuildStatus(ctx, build, pod)
+	// Get the pod for the job
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(build.Namespace),
+		client.MatchingLabels{
+			"job-name": build.Name,
+		}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if len(pods.Items) == 0 {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	pod := &pods.Items[0]
+
+	// Update status and stream logs when pod is running
+	if pod.Status.Phase == corev1.PodRunning {
+		if build.Status.Phase != "Building" {
+			build.Status.Phase = "Building"
+			build.Status.Message = "Build in progress"
+			build.Status.PodName = pod.Name
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Start streaming logs
+			go r.streamLogsToWebsocket(ctx, build, pod)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Check if job completed
+	if job.Status.Succeeded > 0 {
+		// Only process completion once
+		if build.Status.Phase != "Completed" && build.Status.Phase != "Deploying" {
+			// Stream final logs synchronously to ensure we capture everything
+			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
+				log.Error(err, "Failed to capture final logs")
+			}
+
+			// Read Git commit SHA from the file
+			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+				Container: "git-clone",
+			})
+			stream, err := req.Stream(ctx)
+			if err == nil {
+				defer stream.Close()
+				if content, err := io.ReadAll(stream); err == nil {
+					build.Status.GitCommit = strings.TrimSpace(string(content))
+				}
+			}
+
+			build.Status.Phase = "Deploying"
+			build.Status.Message = "Build completed, deploying application"
+			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Build completed successfully, starting deployment",
+				"buildName", build.Name,
+				"appName", app.Name)
+
+			// Delete the completed job
+			background := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{
+				PropagationPolicy: &background,
+			}); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete completed job")
+			}
+
+			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+				log.Error(err, "Failed to create Helm release")
+				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
+			}
+			return ctrl.Result{}, nil
+		}
+		// If we're already in Deploying/Completed phase, no need to requeue
+		return ctrl.Result{}, nil
+	}
+
+	// Check if job failed
+	if job.Status.Failed > 0 {
+		if build.Status.Phase != "Failed" {
+			// Stream final logs synchronously to capture failure details
+			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
+				log.Error(err, "Failed to capture final logs")
+			}
+
+			build.Status.Phase = "Failed"
+			build.Status.Message = "Build failed"
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Delete the failed job
+			background := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{
+				PropagationPolicy: &background,
+			}); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete failed job")
+			}
+
+			return ctrl.Result{}, nil
+		}
+		// If we're already in Failed phase, no need to requeue
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
@@ -291,23 +411,39 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 	// Check if job completed
 	if job.Status.Succeeded > 0 {
 		// Get final logs if we haven't already
-		if build.Status.Phase != "Completed" {
+		if build.Status.Phase != "Completed" && build.Status.Phase != "Deploying" {
 			// Stream final logs synchronously to ensure we capture everything
 			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
 				log.Error(err, "Failed to capture final logs")
 			}
 
-			build.Status.Phase = "Completed"
-			build.Status.Message = "Build completed successfully"
-			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			// Read Git commit SHA from the file
+			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+				Container: "git-clone",
+			})
+			stream, err := req.Stream(ctx)
+			if err == nil {
+				defer stream.Close()
+				if content, err := io.ReadAll(stream); err == nil {
+					build.Status.GitCommit = strings.TrimSpace(string(content))
+				}
+			}
+
+			build.Status.Phase = "Deploying"
+			build.Status.Message = "Build completed, deploying application"
+			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
 
-			log.Info("Build completed successfully",
+			log.Info("Build completed successfully, starting deployment",
 				"buildName", build.Name,
 				"appName", app.Name)
 
+			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+				log.Error(err, "Failed to create Helm release")
+				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
+			}
 			return ctrl.Result{}, nil
 		}
 	}
@@ -334,6 +470,8 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 }
 
 func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv1alpha1.AppBuild, pod *corev1.Pod) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
 	// When pod starts running, initialize log streaming
 	if pod.Status.Phase == corev1.PodRunning && build.Status.Phase != "Building" {
 		build.Status.Phase = "Building"
@@ -351,12 +489,27 @@ func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv
 	// Update phase based on pod status
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded:
-		if build.Status.Phase != "Completed" {
-			build.Status.Phase = "Completed"
-			build.Status.Message = "Build completed successfully"
-			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+		if build.Status.Phase != "Completed" && build.Status.Phase != "Deploying" {
+			build.Status.Phase = "Deploying"
+			build.Status.Message = "Build completed, deploying application"
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
+			}
+
+			log.Info("Build completed successfully, starting deployment",
+				"buildName", build.Name)
+
+			app := &appsv1alpha1.App{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Namespace: build.Namespace,
+				Name:      build.Spec.AppName,
+			}, app); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+				log.Error(err, "Failed to create Helm release")
+				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
 			}
 			return ctrl.Result{}, nil
 		}
@@ -411,47 +564,327 @@ func (r *AppBuildReconciler) streamLogsToWebsocket(ctx context.Context, build *a
 }
 
 func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
-	// Create Kaniko pod
-	pod := &corev1.Pod{
+	log := ctrl.LoggerFrom(ctx)
+
+	// Check if we already have a successful build for this commit
+	if build.Spec.GitRef != "" {
+		// List all successful builds for this app
+		buildList := &appsv1alpha1.AppBuildList{}
+		if err := r.List(ctx, buildList,
+			client.InNamespace(build.Namespace),
+			client.MatchingLabels{
+				"app.kubernetes.io/name": app.Name,
+			}); err != nil {
+			return fmt.Errorf("failed to list builds: %v", err)
+		}
+
+		// Check if we have a successful build with the same commit
+		for _, existingBuild := range buildList.Items {
+			if existingBuild.Status.GitCommit == build.Spec.GitRef &&
+				existingBuild.Status.Phase == "Completed" {
+				log.Info("Found existing successful build for commit",
+					"buildName", existingBuild.Name,
+					"commit", build.Spec.GitRef)
+
+				// Update current build status to reuse the existing image
+				build.Status.Phase = "Deploying"
+				build.Status.Message = fmt.Sprintf("Reusing image from build %s", existingBuild.Name)
+				build.Status.ImageTag = existingBuild.Status.ImageTag
+				build.Status.GitCommit = existingBuild.Status.GitCommit
+				if err := r.Status().Update(ctx, build); err != nil {
+					return fmt.Errorf("failed to update build status: %v", err)
+				}
+
+				// Create Helm release with the existing image
+				if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
+					return fmt.Errorf("failed to create helm release: %v", err)
+				}
+
+				return nil
+			}
+		}
+	}
+
+	log.Info("Creating Kaniko build job",
+		"buildName", build.Name,
+		"appName", app.Name,
+		"gitURL", app.Spec.Git.URL,
+		"registryURL", app.Spec.Registry.URL)
+
+	// Ensure build cache exists
+	if err := r.ensureKanikoBuildCache(ctx, app); err != nil {
+		return fmt.Errorf("failed to create cache: %v", err)
+	}
+
+	// Use default registry secret if none specified
+	registrySecret := "registry-creds"
+	if app.Spec.Registry.SecretName != "" {
+		registrySecret = app.Spec.Registry.SecretName
+	}
+
+	// Create Kaniko job
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-build-%s", app.Name, build.Name),
+			Name:      build.Name,
 			Namespace: build.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":     "kaniko",
-				"app.kubernetes.io/instance": build.Name,
+				"app.kubernetes.io/name":       "kaniko",
+				"app.kubernetes.io/instance":   build.Name,
+				"app.kubernetes.io/managed-by": "shapeblock-operator",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(build, appsv1alpha1.GroupVersion.WithKind("AppBuild")),
 			},
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{{
-				Name:  "kaniko",
-				Image: "gcr.io/kaniko-project/executor:latest",
-				Args: []string{
-					"--dockerfile=Dockerfile",
-					fmt.Sprintf("--context=%s", app.Spec.Git.URL),
-					fmt.Sprintf("--destination=%s/%s:%s", app.Spec.Registry.URL, app.Name, build.Spec.ImageTag),
-				},
-				VolumeMounts: []corev1.VolumeMount{{
-					Name:      "docker-config",
-					MountPath: "/kaniko/.docker",
-				}},
-			}},
-			RestartPolicy: corev1.RestartPolicyNever,
-			Volumes: []corev1.Volume{{
-				Name: "docker-config",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: app.Spec.Registry.SecretName,
-						Items: []corev1.KeyToPath{{
-							Key:  ".dockerconfigjson",
-							Path: "config.json",
-						}},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: pointer.Int32(0),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/name":       "kaniko",
+						"app.kubernetes.io/instance":   build.Name,
+						"app.kubernetes.io/managed-by": "shapeblock-operator",
 					},
 				},
-			}},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					InitContainers: []corev1.Container{
+						{
+							Name:    "git-clone",
+							Image:   "alpine/git:latest",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(`
+									git clone --branch %s %s /workspace/source
+									cd /workspace/source
+									git rev-parse HEAD > /workspace/git-commit
+								`, app.Spec.Git.Branch, app.Spec.Git.URL),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "source",
+									MountPath: "/workspace/source",
+								},
+								{
+									Name:      "git-commit",
+									MountPath: "/workspace/git-commit",
+								},
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:  "kaniko",
+							Image: "gcr.io/kaniko-project/executor:latest",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
+									corev1.ResourceCPU:    resource.MustParse("250m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
+									corev1.ResourceCPU:    resource.MustParse("500m"),
+								},
+							},
+							Args: []string{
+								"--dockerfile=Dockerfile",
+								"--context=dir:///workspace/source",
+								"--cache=true",
+								"--cache-dir=/cache",
+								"--cache-repo=" + fmt.Sprintf("%s/%s/%s-cache", app.Spec.Registry.URL, app.Namespace, app.Name),
+								fmt.Sprintf("--destination=%s/%s/%s:%s", app.Spec.Registry.URL, app.Namespace, app.Name, build.Spec.ImageTag),
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "registry-creds",
+									MountPath: "/kaniko/.docker",
+								},
+								{
+									Name:      "source",
+									MountPath: "/workspace/source",
+								},
+								{
+									Name:      "cache",
+									MountPath: "/cache",
+								},
+								{
+									Name:      "git-commit",
+									MountPath: "/workspace/git-commit",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "registry-creds",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: registrySecret,
+									Items: []corev1.KeyToPath{
+										{
+											Key:  ".dockerconfigjson",
+											Path: "config.json",
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "source",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "cache",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: fmt.Sprintf("kaniko-cache-%s", app.Name),
+								},
+							},
+						},
+						{
+							Name: "git-commit",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 
-	return r.Create(ctx, pod)
+	// Add SSH key volume for private repositories if needed
+	if app.Spec.Git.SecretName != "" {
+		job.Spec.Template.Spec.Volumes = append(
+			job.Spec.Template.Spec.Volumes,
+			corev1.Volume{
+				Name: "ssh-key",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName:  app.Spec.Git.SecretName,
+						DefaultMode: pointer.Int32(0400),
+					},
+				},
+			},
+		)
+
+		// Update git clone container for SSH
+		job.Spec.Template.Spec.InitContainers[0].Command = []string{"/bin/sh", "-c"}
+		job.Spec.Template.Spec.InitContainers[0].Args = []string{
+			`mkdir -p /tmp/.ssh
+			cp /root/.ssh/ssh-privatekey /tmp/.ssh/id_rsa
+			chmod 400 /tmp/.ssh/id_rsa
+			GIT_SSH_COMMAND="ssh -i /tmp/.ssh/id_rsa -o StrictHostKeyChecking=no" git clone --branch ` +
+				app.Spec.Git.Branch + " " + app.Spec.Git.URL + " /workspace/source\n" +
+				"cd /workspace/source\n" +
+				"git rev-parse HEAD > /workspace/git-commit",
+		}
+		job.Spec.Template.Spec.InitContainers[0].VolumeMounts = append(
+			job.Spec.Template.Spec.InitContainers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:      "ssh-key",
+				MountPath: "/root/.ssh",
+			},
+		)
+	}
+
+	// Try to get existing job
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      build.Name,
+		Namespace: build.Namespace,
+	}, existingJob)
+
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to check for existing job: %v", err)
+		}
+		// Job doesn't exist, create it
+		if err := r.Create(ctx, job); err != nil {
+			log.Error(err, "Failed to create Kaniko job",
+				"buildName", build.Name,
+				"appName", app.Name)
+			return fmt.Errorf("failed to create Kaniko job: %v", err)
+		}
+	} else {
+		// Job exists, check if it's failed
+		if isJobFinished(existingJob) {
+			for _, condition := range existingJob.Status.Conditions {
+				if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+					// Only recreate if the job failed
+					if err := r.Delete(ctx, existingJob); err != nil {
+						return fmt.Errorf("failed to delete failed job: %v", err)
+					}
+					if err := r.Create(ctx, job); err != nil {
+						log.Error(err, "Failed to create new Kaniko job",
+							"buildName", build.Name,
+							"appName", app.Name)
+						return fmt.Errorf("failed to create new Kaniko job: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	log.Info("Successfully handled Kaniko job",
+		"jobName", job.Name,
+		"buildName", build.Name,
+		"appName", app.Name)
+
+	return nil
+}
+
+// Helper function to create PVC for Kaniko cache if it doesn't exist
+func (r *AppBuildReconciler) ensureKanikoBuildCache(ctx context.Context, app *appsv1alpha1.App) error {
+	cachePVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kaniko-cache-%s", app.Name),
+			Namespace: app.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":      app.Name,
+				"app.kubernetes.io/component": "kaniko-cache",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("5Gi"),
+				},
+			},
+		},
+	}
+
+	err := r.Create(ctx, cachePVC)
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create kaniko cache PVC: %v", err)
+	}
+
+	return nil
+}
+
+// Helper function to check if a job is finished
+func isJobFinished(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AppBuildReconciler) failBuild(ctx context.Context, build *appsv1alpha1.AppBuild, message string) (ctrl.Result, error) {
@@ -512,6 +945,16 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 							Image:   "busybox:1.36.1",
 							Command: []string{"/bin/sh", "-c"},
 							Args:    []string{r.generatePlatformScript(build.Spec.BuildVars)},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("32Mi"),
+									corev1.ResourceCPU:    resource.MustParse("50m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "platform",
@@ -522,11 +965,32 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 						{
 							Name:    "git-clone",
 							Image:   "alpine/git:latest",
-							Command: []string{"git", "clone", "--branch", build.Spec.GitRef, app.Spec.Git.URL, "/workspace/source"},
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(`
+									git clone --branch %s %s /workspace/source
+									cd /workspace/source
+									git rev-parse HEAD > /workspace/git-commit
+								`, build.Spec.GitRef, app.Spec.Git.URL),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+								},
+							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "source",
 									MountPath: "/workspace/source",
+								},
+								{
+									Name:      "git-commit",
+									MountPath: "/workspace/git-commit",
 								},
 							},
 						},
@@ -536,6 +1000,16 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 							Name:    "buildpack",
 							Image:   app.Spec.Build.BuilderImage,
 							Command: []string{"/cnb/lifecycle/creator"},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
+									corev1.ResourceCPU:    resource.MustParse("250m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
+									corev1.ResourceCPU:    resource.MustParse("500m"),
+								},
+							},
 							Args: []string{
 								"-app=/workspace/source",
 								"-cache-dir=/workspace/cache",
@@ -557,7 +1031,14 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 							VolumeMounts: r.getBuildpackVolumeMounts(),
 						},
 					},
-					Volumes: r.getBuildVolumes(app),
+					Volumes: append(r.getBuildVolumes(app),
+						corev1.Volume{
+							Name: "git-commit",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					),
 				},
 			},
 		},
@@ -582,10 +1063,12 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 		job.Spec.Template.Spec.InitContainers[1].Command = []string{"/bin/sh", "-c"}
 		job.Spec.Template.Spec.InitContainers[1].Args = []string{
 			`mkdir -p /tmp/.ssh
-			 cp /root/.ssh/ssh-privatekey /tmp/.ssh/id_rsa
-			 chmod 400 /tmp/.ssh/id_rsa
-			 GIT_SSH_COMMAND="ssh -i /tmp/.ssh/id_rsa -o StrictHostKeyChecking=no" git clone --branch ` +
-				build.Spec.GitRef + " " + app.Spec.Git.URL + " /workspace/source",
+			cp /root/.ssh/ssh-privatekey /tmp/.ssh/id_rsa
+			chmod 400 /tmp/.ssh/id_rsa
+			GIT_SSH_COMMAND="ssh -i /tmp/.ssh/id_rsa -o StrictHostKeyChecking=no" git clone --branch ` +
+				build.Spec.GitRef + " " + app.Spec.Git.URL + " /workspace/source\n" +
+				"cd /workspace/source\n" +
+				"git rev-parse HEAD > /workspace/git-commit",
 		}
 		job.Spec.Template.Spec.InitContainers[1].VolumeMounts = append(
 			job.Spec.Template.Spec.InitContainers[1].VolumeMounts,
@@ -793,18 +1276,10 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 
 	// First try to get existing HelmChart
 	existing := &helmv1.HelmChart{}
-	log.Info("Attempting to get existing HelmChart",
-		"name", app.Name,
-		"namespace", build.Namespace)
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
 		Namespace: build.Namespace,
 	}, existing)
-
-	log.Info("Get HelmChart result",
-		"error", err,
-		"existing.Name", existing.GetName(),
-		"existing.Namespace", existing.GetNamespace())
 
 	// Default values for nxs-universal-chart
 	defaultValues := map[string]interface{}{}
@@ -856,28 +1331,32 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		},
 	}
 
-	log.Info("Prepared HelmChart object",
-		"name", helmChart.GetName(),
-		"namespace", helmChart.GetNamespace(),
-		"apiVersion", helmChart.APIVersion,
-		"kind", helmChart.Kind)
-
-	// Always create a new HelmChart if the existing one is invalid
-	if err != nil || existing.GetName() == "" || existing.GetNamespace() == "" {
+	// Create new HelmChart if it doesn't exist
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to get HelmChart: %v", err)
+		}
 		log.Info("Creating new HelmChart",
 			"appName", app.Name,
 			"buildName", build.Name,
-			"namespace", build.Namespace,
-			"error", err)
+			"namespace", build.Namespace)
 		return r.Create(ctx, helmChart)
 	}
 
-	// Update existing chart
-	log.Info("Updating existing HelmChart",
-		"name", existing.GetName(),
-		"namespace", existing.GetNamespace())
-	existing.Spec = helmChart.Spec
-	return r.Update(ctx, existing)
+	// Check if update is needed by comparing specs
+	if existing.Spec.Chart != helmChart.Spec.Chart ||
+		existing.Spec.Version != helmChart.Spec.Version ||
+		existing.Spec.Repo != helmChart.Spec.Repo ||
+		existing.Spec.TargetNamespace != helmChart.Spec.TargetNamespace ||
+		existing.Spec.ValuesContent != helmChart.Spec.ValuesContent {
+		log.Info("Updating HelmChart due to spec changes",
+			"name", existing.GetName(),
+			"namespace", existing.GetNamespace())
+		existing.Spec = helmChart.Spec
+		return r.Update(ctx, existing)
+	}
+
+	return nil
 }
 
 // Helper function to merge maps with deep merge support
@@ -925,6 +1404,11 @@ func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
 func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	// If build is already completed, don't requeue
+	if build.Status.Phase == "Completed" {
+		return ctrl.Result{}, nil
+	}
+
 	helmChart := &helmv1.HelmChart{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
@@ -964,14 +1448,48 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 	// Check job conditions
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			log.Info("Helm release completed successfully",
-				"appName", app.Name,
-				"buildName", build.Name)
-			build.Status.Message = "Helm release completed successfully"
-			if err := r.Status().Update(ctx, build); err != nil {
+			// Check if all pods are ready
+			podList := &corev1.PodList{}
+			if err := r.List(ctx, podList,
+				client.InNamespace(build.Namespace),
+				client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
 				return ctrl.Result{}, err
 			}
-			r.sendBuildStatus(build)
+
+			allPodsReady := true
+			for _, pod := range podList.Items {
+				if pod.Status.Phase != corev1.PodRunning {
+					allPodsReady = false
+					break
+				}
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
+						allPodsReady = false
+						break
+					}
+				}
+			}
+
+			if !allPodsReady {
+				log.Info("Waiting for pods to be ready",
+					"appName", app.Name,
+					"buildName", build.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Only update status if not already completed
+			if build.Status.Phase != "Completed" {
+				log.Info("Helm release completed successfully",
+					"appName", app.Name,
+					"buildName", build.Name)
+				build.Status.Phase = "Completed"
+				build.Status.Message = "Application deployed successfully"
+				build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+				if err := r.Status().Update(ctx, build); err != nil {
+					return ctrl.Result{}, err
+				}
+				r.sendBuildStatus(build)
+			}
 			return ctrl.Result{}, nil
 		}
 

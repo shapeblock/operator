@@ -79,23 +79,35 @@ spec:
                 type: string
             required:
             - appName
-            - gitRef
-            - imageTag
             type: object
           status:
             description: AppBuildStatus defines the observed state of AppBuild
             properties:
               completionTime:
+                description: Timestamps
                 format: date-time
                 type: string
               message:
                 description: Human-readable message
                 type: string
               phase:
+                default: Pending
                 description: Current phase of the build
+                enum:
+                - Pending
+                - Building
+                - Deploying
+                - Completed
+                - Failed
                 type: string
               podName:
-                description: Build pod details for log streaming
+                description: Build pod details for log streaming. Only set for dockerfile and buildpack builds
+                type: string
+              gitCommit:
+                description: Git commit SHA of the code being built
+                type: string
+              imageTag:
+                description: Image tag for the built container
                 type: string
               startTime:
                 description: Timestamps

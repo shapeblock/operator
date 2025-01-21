@@ -289,11 +289,15 @@ Handles the build process.
 # TODOs
 - [ ] identify patchable fields in app and appbuild CR
 - [x] service CR
-- [ ] test dockerfile build
+- [x] test dockerfile build
+- [x] kaniko cache
+- [ ] different dockerfile
 - [x] test buildpack build
-- [ ] test pre-built image build
+- [x] test pre-built image build
+- [x] Add resource limits to appbuild job
 - [ ] identify and optimize websocket flow
-- [ ] previous image as status field for App CR
 - [ ] test private repo creation(and deletion)
-- [ ] service backup and restore CRs(?)
-- [ ] create a github action for the build
+- [x] previous image as status field for App CR
+- [ ] create a github action for the controller
+- [ ] record build timestamps in appbuild CR
+- [ ] add labels to appbuild job

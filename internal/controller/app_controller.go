@@ -50,8 +50,27 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			"app", app.Name,
 			"namespace", app.Namespace,
 			"gitUrl", app.Spec.Git.URL)
-		// Requeue to continue with the rest of the reconciliation
+		// Requeue to continue with the reconciliation
 		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Validate based on build type
+	if app.Spec.Build.Type == "image" {
+		// For image type, image and registry.secretName are required
+		if app.Spec.Build.Image == "" {
+			return r.failApp(ctx, app, "build.image is required for image type")
+		}
+		if app.Spec.Registry.SecretName == "" {
+			return r.failApp(ctx, app, "registry.secretName is required for image type")
+		}
+	} else {
+		// For other types, git.url and registry.url are required
+		if app.Spec.Git.URL == "" {
+			return r.failApp(ctx, app, "git.url is required for non-image type")
+		}
+		if app.Spec.Registry.URL == "" {
+			return r.failApp(ctx, app, "registry.url is required for non-image type")
+		}
 	}
 
 	// Handle private repository setup if needed
@@ -64,32 +83,21 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 	}
 
-	// Create or update registry secret
+	// Check if registry secret exists
 	if app.Spec.Registry.SecretName != "" {
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      app.Spec.Registry.SecretName,
-				Namespace: app.Namespace,
-				Labels: map[string]string{
-					"app.kubernetes.io/name":       app.Name,
-					"app.kubernetes.io/managed-by": "shapeblock-operator",
-				},
-			},
-			Type: corev1.SecretTypeDockerConfigJson,
-			// ... secret data setup ...
-		}
-
-		if err := r.Create(ctx, secret); err != nil {
-			if !errors.IsAlreadyExists(err) {
-				log.Error(err, "Failed to create registry secret")
-				return r.failApp(ctx, app, fmt.Sprintf("Failed to create registry secret: %v", err))
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      app.Spec.Registry.SecretName,
+			Namespace: app.Namespace,
+		}, secret); err != nil {
+			if errors.IsNotFound(err) {
+				return r.failApp(ctx, app, fmt.Sprintf("Registry secret %s not found in namespace %s", app.Spec.Registry.SecretName, app.Namespace))
 			}
-			log.Info("Registry secret already exists",
-				"secretName", app.Spec.Registry.SecretName)
-		} else {
-			log.Info("Successfully created registry secret",
-				"secretName", app.Spec.Registry.SecretName,
-				"app", app.Name)
+			return r.failApp(ctx, app, fmt.Sprintf("Failed to get registry secret: %v", err))
+		}
+		// Verify secret is of correct type
+		if secret.Type != corev1.SecretTypeDockerConfigJson {
+			return r.failApp(ctx, app, fmt.Sprintf("Registry secret %s must be of type %s", app.Spec.Registry.SecretName, corev1.SecretTypeDockerConfigJson))
 		}
 	}
 
@@ -115,26 +123,43 @@ func (r *AppReconciler) updateAppStatus(ctx context.Context, app *appsv1alpha1.A
 		return err
 	}
 
-	// Update status fields
-	latest.Status.Phase = phase
-	if message != "" {
-		latest.Status.Message = message
+	// If status is already set to desired values, return
+	if latest.Status.Phase == phase && latest.Status.Message == message {
+		return nil
 	}
-	latest.Status.LastUpdated = &metav1.Time{Time: time.Now()}
 
-	// Update status and send websocket notification
-	if err := r.Status().Update(ctx, latest); err != nil {
+	// Create a copy of the latest object
+	patch := latest.DeepCopy()
+
+	// Update status fields
+	patch.Status.Phase = phase
+	if message != "" {
+		patch.Status.Message = message
+	}
+	patch.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+
+	// Use strategic merge patch to update status
+	if err := r.Status().Patch(ctx, patch, client.MergeFrom(latest)); err != nil {
+		if errors.IsConflict(err) {
+			// If there's a conflict, requeue the reconciliation
+			return fmt.Errorf("conflict updating App status, will retry: %v", err)
+		}
 		return err
 	}
+
 	statusUpdate := utils.NewStatusUpdate("App", latest.Name, latest.Namespace)
-	statusUpdate.Status = latest.Status.Phase
-	statusUpdate.Message = latest.Status.Message
+	statusUpdate.Status = patch.Status.Phase
+	statusUpdate.Message = patch.Status.Message
 	r.WebsocketClient.SendStatus(statusUpdate)
 	return nil
 }
 
 func (r *AppReconciler) failApp(ctx context.Context, app *appsv1alpha1.App, message string) (ctrl.Result, error) {
 	if err := r.updateAppStatus(ctx, app, "Failed", message); err != nil {
+		if errors.IsConflict(err) {
+			// If there's a conflict, requeue after a short delay
+			return ctrl.Result{Requeue: true, RequeueAfter: time.Second}, nil
+		}
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, fmt.Errorf(message)
@@ -178,11 +203,24 @@ func (r *AppReconciler) setupPrivateRepo(ctx context.Context, app *appsv1alpha1.
 			"app", app.Name)
 	}
 
-	// Update App with secret reference
-	app.Spec.Git.SecretName = secret.Name
-	if err := r.Update(ctx, app); err != nil {
+	// Get latest version of App before updating
+	latest := &appsv1alpha1.App{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: app.Namespace,
+		Name:      app.Name,
+	}, latest); err != nil {
+		return fmt.Errorf("failed to get latest App version: %v", err)
+	}
+
+	// Create patch with the secret reference
+	patch := latest.DeepCopy()
+	patch.Spec.Git.SecretName = secret.Name
+
+	// Apply patch using strategic merge
+	if err := r.Patch(ctx, patch, client.MergeFrom(latest)); err != nil {
 		return fmt.Errorf("failed to update App with secret reference: %v", err)
 	}
+
 	log.Info("Updated app with SSH secret reference",
 		"app", app.Name,
 		"secretName", secret.Name)

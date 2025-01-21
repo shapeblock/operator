@@ -7,18 +7,21 @@ import (
 // AppSpec defines the desired state of App
 type AppSpec struct {
 	// DisplayName is the human-readable name of the application
+	// +kubebuilder:validation:Required
 	DisplayName string `json:"displayName"`
 
 	// Description of the application
 	Description string `json:"description,omitempty"`
 
 	// Git repository configuration
-	Git GitSpec `json:"git"`
+	// +kubebuilder:validation:Optional
+	Git GitSpec `json:"git,omitempty"`
 
 	// Registry configuration for storing built images
 	Registry RegistrySpec `json:"registry"`
 
 	// Build configuration template
+	// +kubebuilder:validation:Required
 	Build BuildSpec `json:"build"`
 }
 
@@ -38,20 +41,24 @@ type GitSpec struct {
 
 type RegistrySpec struct {
 	// URL of the container registry
-	URL string `json:"url"`
+	// +kubebuilder:validation:Optional
+	URL string `json:"url,omitempty"`
 
 	// Secret name containing registry credentials
 	SecretName string `json:"secretName,omitempty"`
 }
 
 type BuildSpec struct {
-	// Type of build: dockerfile, buildpack, or prebuilt
+	// Type of build: dockerfile, buildpack, or image
+	// +kubebuilder:validation:Enum=dockerfile;buildpack;image
 	Type string `json:"type"`
 
 	// Builder image for buildpack builds
+	// +kubebuilder:validation:Optional
 	BuilderImage string `json:"builderImage,omitempty"`
 
 	// Prebuilt image
+	// +kubebuilder:validation:Optional
 	Image string `json:"image,omitempty"`
 }
 
