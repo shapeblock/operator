@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +35,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"encoding/base64"
 
 	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
@@ -192,6 +195,11 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			"image", app.Spec.Build.Image)
 
 		if build.Status.Phase == "" || build.Status.Phase == "Pending" {
+			// Validate registry credentials using the actual image
+			if err := r.validateRegistryCredentials(ctx, app, build, app.Spec.Build.Image); err != nil {
+				return r.failBuild(ctx, build, fmt.Sprintf("registry validation failed: %v", err))
+			}
+
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Deploying pre-built image"
 			build.Status.StartTime = &metav1.Time{Time: time.Now()}
@@ -713,8 +721,149 @@ func (r *AppBuildReconciler) streamLogsToWebsocket(ctx context.Context, build *a
 	}
 }
 
+// Validate registry credentials before starting build
+func (r *AppBuildReconciler) validateRegistryCredentials(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild, testImage string) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Use default registry secret if none specified
+	registrySecret := "registry-creds"
+	if app.Spec.Registry.SecretName != "" {
+		registrySecret = app.Spec.Registry.SecretName
+	}
+
+	// Get registry secret
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      registrySecret,
+		Namespace: build.Namespace,
+	}, secret); err != nil {
+		if errors.IsNotFound(err) {
+			return fmt.Errorf("registry secret %s not found", registrySecret)
+		}
+		return fmt.Errorf("failed to get registry secret: %v", err)
+	}
+
+	// Check if .dockerconfigjson exists
+	dockerConfig, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		return fmt.Errorf("invalid registry secret: .dockerconfigjson key not found")
+	}
+
+	// Parse docker config
+	var config struct {
+		Auths map[string]struct {
+			Auth     string `json:"auth"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"auths"`
+	}
+
+	if err := json.Unmarshal(dockerConfig, &config); err != nil {
+		return fmt.Errorf("invalid registry secret: failed to parse .dockerconfigjson: %v", err)
+	}
+
+	// Check if credentials exist for the registry
+	registryURL := app.Spec.Registry.URL
+	var auth struct {
+		Username string
+		Password string
+	}
+
+	// Try exact match first
+	if creds, ok := config.Auths[registryURL]; ok {
+		if creds.Auth != "" {
+			// Decode base64 auth string
+			decoded, err := base64.StdEncoding.DecodeString(creds.Auth)
+			if err != nil {
+				return fmt.Errorf("invalid auth string in registry credentials")
+			}
+			parts := strings.SplitN(string(decoded), ":", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid auth string format in registry credentials")
+			}
+			auth.Username = parts[0]
+			auth.Password = parts[1]
+		} else {
+			auth.Username = creds.Username
+			auth.Password = creds.Password
+		}
+	} else if creds, ok := config.Auths["https://"+registryURL]; ok {
+		// Try with https:// prefix
+		if creds.Auth != "" {
+			decoded, err := base64.StdEncoding.DecodeString(creds.Auth)
+			if err != nil {
+				return fmt.Errorf("invalid auth string in registry credentials")
+			}
+			parts := strings.SplitN(string(decoded), ":", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid auth string format in registry credentials")
+			}
+			auth.Username = parts[0]
+			auth.Password = parts[1]
+		} else {
+			auth.Username = creds.Username
+			auth.Password = creds.Password
+		}
+	} else {
+		return fmt.Errorf("registry credentials not found for %s", registryURL)
+	}
+
+	// Create HTTP client with reasonable timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// Construct registry auth URL
+	authURL := fmt.Sprintf("https://%s/v2/", registryURL)
+	req, err := http.NewRequestWithContext(ctx, "GET", authURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create registry auth request: %v", err)
+	}
+
+	// Add basic auth header
+	req.SetBasicAuth(auth.Username, auth.Password)
+
+	// Make the request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to connect to registry: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusUnauthorized:
+		// Check WWW-Authenticate header for specific error
+		if authHeader := resp.Header.Get("WWW-Authenticate"); authHeader != "" && resp.StatusCode == http.StatusUnauthorized {
+			if strings.Contains(strings.ToLower(authHeader), "invalid credentials") {
+				return fmt.Errorf("invalid registry credentials")
+			}
+			return fmt.Errorf("registry authentication failed: %s", authHeader)
+		}
+	case http.StatusNotFound:
+		return fmt.Errorf("registry API endpoint not found, please check the registry URL")
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected registry response (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// If we get here with StatusOK, credentials are valid
+	if resp.StatusCode == http.StatusOK {
+		log.Info("Registry credentials validated successfully",
+			"registry", registryURL)
+		return nil
+	}
+
+	return fmt.Errorf("failed to validate registry credentials")
+}
+
 func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
 	log := ctrl.LoggerFrom(ctx)
+
+	// Validate registry credentials first using busybox as test image
+	if err := r.validateRegistryCredentials(ctx, app, build, "busybox:1.36.1"); err != nil {
+		return fmt.Errorf("registry validation failed: %v", err)
+	}
 
 	// Check if we already have a successful build for this commit
 	if build.Spec.GitRef != "" {
@@ -1094,6 +1243,11 @@ func (r *AppBuildReconciler) failBuild(ctx context.Context, build *appsv1alpha1.
 
 func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
 	log := ctrl.LoggerFrom(ctx)
+
+	// Validate registry credentials first using busybox as test image
+	if err := r.validateRegistryCredentials(ctx, app, build, "busybox:1.36.1"); err != nil {
+		return fmt.Errorf("registry validation failed: %v", err)
+	}
 
 	// Ensure build cache exists
 	if err := r.ensureBuildCache(ctx, app); err != nil {

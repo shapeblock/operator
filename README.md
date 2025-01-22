@@ -296,7 +296,7 @@ Handles the build process.
 - [x] test pre-built image build
 - [x] Add resource limits to appbuild job
 - [ ] image reuse
-- [ ] failure scenarios
+- [x] failure scenarios
 - [ ] identify and optimize websocket flow
 - [x] test private repo creation(and deletion)
 - [x] previous image as status field for App CR
