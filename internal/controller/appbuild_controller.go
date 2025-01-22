@@ -1688,6 +1688,50 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		return ctrl.Result{}, nil
 	}
 
+	// Check if we've exceeded the timeout (10 minutes)
+	if build.Status.BuildEndTime != nil && time.Since(build.Status.BuildEndTime.Time) > 10*time.Minute {
+		// Get all pods for detailed resource issues before failing
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList,
+			client.InNamespace(build.Namespace),
+			client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
+			return r.failBuild(ctx, build, "Helm deployment timed out and failed to get pod status")
+		}
+
+		var resourceIssues []string
+		for _, pod := range podList.Items {
+			// Check if pod is pending due to resource constraints
+			if pod.Status.Phase == corev1.PodPending {
+				// Get the pod's events for detailed error message
+				eventList := &corev1.EventList{}
+				if err := r.List(ctx, eventList,
+					client.InNamespace(pod.Namespace),
+					client.MatchingFields{"involvedObject.name": pod.Name}); err != nil {
+					log.Error(err, "Failed to get pod events")
+					continue
+				}
+
+				for _, event := range eventList.Items {
+					if strings.Contains(event.Message, "Insufficient memory") ||
+						strings.Contains(event.Message, "Insufficient cpu") ||
+						strings.Contains(event.Message, "OutOf") {
+						resourceIssues = append(resourceIssues,
+							fmt.Sprintf("Pod %s: %s", pod.Name, event.Message))
+					}
+				}
+			}
+		}
+
+		if len(resourceIssues) > 0 {
+			failureMsg := "Helm deployment failed due to insufficient cluster resources after waiting for 10 minutes.\n"
+			failureMsg += "Resource issues:\n- " + strings.Join(resourceIssues, "\n- ")
+			failureMsg += "\nPlease check your resource requests/limits or cluster capacity."
+			return r.failBuild(ctx, build, failureMsg)
+		}
+
+		return r.failBuild(ctx, build, "Helm deployment timed out after 10 minutes. Please check the helm release status and logs.")
+	}
+
 	helmChart := &helmv1.HelmChart{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
@@ -1735,24 +1779,68 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 				return ctrl.Result{}, err
 			}
 
+			if len(podList.Items) == 0 {
+				log.Info("Waiting for application pods to be created",
+					"appName", app.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
 			allPodsReady := true
+			var notReadyPods []string
+			var resourceConstrainedPods []string
+
 			for _, pod := range podList.Items {
+				if pod.Status.Phase == corev1.PodPending {
+					// Check if pending due to resource constraints
+					for _, condition := range pod.Status.Conditions {
+						if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+							if strings.Contains(condition.Message, "Insufficient memory") ||
+								strings.Contains(condition.Message, "Insufficient cpu") {
+								resourceConstrainedPods = append(resourceConstrainedPods,
+									fmt.Sprintf("%s (%s)", pod.Name, condition.Message))
+								allPodsReady = false
+								continue
+							}
+						}
+					}
+				}
+
 				if pod.Status.Phase != corev1.PodRunning {
 					allPodsReady = false
-					break
+					notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Phase: %s)", pod.Name, pod.Status.Phase))
+					continue
 				}
 				for _, condition := range pod.Status.Conditions {
 					if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
 						allPodsReady = false
+						notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Not Ready: %s)", pod.Name, condition.Message))
 						break
 					}
 				}
 			}
 
 			if !allPodsReady {
+				statusMsg := "Waiting for application pods to be ready"
+				if len(resourceConstrainedPods) > 0 {
+					statusMsg = "Waiting for compute resources to be available"
+					log.Info("Pods waiting for resources",
+						"appName", app.Name,
+						"buildName", build.Name,
+						"resourceConstrainedPods", strings.Join(resourceConstrainedPods, ", "))
+				}
+
 				log.Info("Waiting for pods to be ready",
 					"appName", app.Name,
-					"buildName", build.Name)
+					"buildName", build.Name,
+					"notReadyPods", strings.Join(notReadyPods, ", "))
+
+				// Update build status with pod readiness info
+				if build.Status.Message != statusMsg {
+					build.Status.Message = statusMsg
+					if err := r.Status().Update(ctx, build); err != nil {
+						return ctrl.Result{}, err
+					}
+				}
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
@@ -1773,11 +1861,31 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		}
 
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			// Get the helm job pod for logs
+			helmPods := &corev1.PodList{}
+			if err := r.List(ctx, helmPods,
+				client.InNamespace(build.Namespace),
+				client.MatchingLabels{"job-name": job.Name}); err != nil {
+				log.Error(err, "Failed to get helm job pods")
+			}
+
+			failureMsg := "Helm release failed"
+			if len(helmPods.Items) > 0 {
+				// Get the logs from the helm job pod
+				req := r.CoreV1Client.Pods(build.Namespace).GetLogs(helmPods.Items[0].Name, &corev1.PodLogOptions{})
+				logs, err := req.DoRaw(ctx)
+				if err != nil {
+					log.Error(err, "Failed to get helm job logs")
+				} else {
+					failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
+				}
+			}
+
 			log.Error(nil, "Helm release failed",
 				"appName", app.Name,
 				"buildName", build.Name,
-				"message", condition.Message)
-			return r.failBuild(ctx, build, fmt.Sprintf("Helm release failed: %s", condition.Message))
+				"message", failureMsg)
+			return r.failBuild(ctx, build, failureMsg)
 		}
 	}
 
