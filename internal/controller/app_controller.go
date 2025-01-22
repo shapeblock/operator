@@ -252,7 +252,26 @@ func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types
 		log.Info("Deleted job", "job", job.Name)
 	}
 
-	// 2. Delete the HelmChart CR
+	// 2. Delete the SSH secret if it exists
+	sshSecret := &corev1.Secret{}
+	sshSecretName := fmt.Sprintf("%s-git-auth", namespacedName.Name)
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      sshSecretName,
+		Namespace: namespacedName.Namespace,
+	}, sshSecret); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Error(err, "Failed to get SSH secret")
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := r.Delete(ctx, sshSecret); err != nil {
+			log.Error(err, "Failed to delete SSH secret")
+			return ctrl.Result{}, err
+		}
+		log.Info("Deleted SSH secret", "name", sshSecret.Name)
+	}
+
+	// 3. Delete the HelmChart CR
 	helmChart := &helmv1.HelmChart{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      namespacedName.Name,
@@ -270,7 +289,7 @@ func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types
 		log.Info("Deleted HelmChart", "name", helmChart.Name)
 	}
 
-	// 3. Delete the cache PVC
+	// 4. Delete the cache PVC
 	pvc := &corev1.PersistentVolumeClaim{}
 	pvcName := fmt.Sprintf("cache-%s", namespacedName.Name)
 	if err := r.Get(ctx, types.NamespacedName{

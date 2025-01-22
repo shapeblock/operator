@@ -295,9 +295,10 @@ Handles the build process.
 - [x] test buildpack build
 - [x] test pre-built image build
 - [x] Add resource limits to appbuild job
+- [ ] image reuse
 - [ ] identify and optimize websocket flow
-- [ ] test private repo creation(and deletion)
+- [x] test private repo creation(and deletion)
 - [x] previous image as status field for App CR
 - [ ] create a github action for the controller
-- [ ] record build timestamps in appbuild CR
+- [x] record build timestamps in appbuild CR
 - [ ] add labels to appbuild job

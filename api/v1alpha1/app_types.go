@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // AppSpec defines the desired state of App
@@ -23,6 +24,11 @@ type AppSpec struct {
 	// Build configuration template
 	// +kubebuilder:validation:Required
 	Build BuildSpec `json:"build"`
+
+	// HelmValues contains values to be passed to the Helm chart
+	// This can include node affinity settings for the deployed application
+	// +kubebuilder:validation:Optional
+	HelmValues *runtime.RawExtension `json:"helmValues,omitempty"`
 }
 
 type GitSpec struct {

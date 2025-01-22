@@ -109,6 +109,14 @@ spec:
               imageTag:
                 description: Image tag for the built container
                 type: string
+              buildStartTime:
+                description: Time when the actual build process started (when pod starts running)
+                format: date-time
+                type: string
+              buildEndTime:
+                description: Time when the build process completed (before deployment phase)
+                format: date-time
+                type: string
               startTime:
                 description: Timestamps
                 format: date-time

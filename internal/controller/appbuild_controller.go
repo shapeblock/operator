@@ -265,6 +265,7 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 			build.Status.Phase = "Building"
 			build.Status.Message = "Build in progress"
 			build.Status.PodName = pod.Name
+			build.Status.BuildStartTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -286,18 +287,27 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 			// Read Git commit SHA from the file
 			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 				Container: "git-clone",
+				Follow:    false,
 			})
 			stream, err := req.Stream(ctx)
 			if err == nil {
 				defer stream.Close()
 				if content, err := io.ReadAll(stream); err == nil {
-					build.Status.GitCommit = strings.TrimSpace(string(content))
+					// Extract the commit SHA from the git rev-parse output
+					lines := strings.Split(string(content), "\n")
+					for _, line := range lines {
+						if len(line) == 40 { // Git commit SHA is 40 characters
+							build.Status.GitCommit = line
+							break
+						}
+					}
 				}
 			}
 
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
 			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
+			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -335,6 +345,7 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 			build.Status.Phase = "Failed"
 			build.Status.Message = "Build failed"
 			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -399,6 +410,7 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 			build.Status.Phase = "Building"
 			build.Status.Message = "Build in progress"
 			build.Status.PodName = pod.Name
+			build.Status.BuildStartTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -420,18 +432,27 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 			// Read Git commit SHA from the file
 			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
 				Container: "git-clone",
+				Follow:    false,
 			})
 			stream, err := req.Stream(ctx)
 			if err == nil {
 				defer stream.Close()
 				if content, err := io.ReadAll(stream); err == nil {
-					build.Status.GitCommit = strings.TrimSpace(string(content))
+					// Extract the commit SHA from the git rev-parse output
+					lines := strings.Split(string(content), "\n")
+					for _, line := range lines {
+						if len(line) == 40 { // Git commit SHA is 40 characters
+							build.Status.GitCommit = line
+							break
+						}
+					}
 				}
 			}
 
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
 			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
+			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -459,6 +480,7 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 			build.Status.Phase = "Failed"
 			build.Status.Message = "Build failed"
 			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -622,6 +644,135 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 		registrySecret = app.Spec.Registry.SecretName
 	}
 
+	// Create base volumes list
+	volumes := []corev1.Volume{
+		{
+			Name: "registry-creds",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: registrySecret,
+					Items: []corev1.KeyToPath{
+						{
+							Key:  ".dockerconfigjson",
+							Path: "config.json",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "source",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: fmt.Sprintf("kaniko-cache-%s", app.Name),
+				},
+			},
+		},
+		{
+			Name: "git-commit",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	// Create base git-clone container
+	gitCloneContainer := corev1.Container{
+		Name:    "git-clone",
+		Image:   "bitnami/git:latest",
+		Command: []string{"/bin/sh", "-c"},
+		Args: []string{
+			`set -e
+			mkdir -p /root/.ssh
+			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+			chmod 400 /root/.ssh/id_rsa
+			ssh-keyscan -H github.com > /root/.ssh/known_hosts
+			chmod 400 /root/.ssh/known_hosts
+
+			# Configure SSH to use the key
+			cat > /root/.ssh/config << EOF
+Host github.com
+    StrictHostKeyChecking no
+    IdentityFile /root/.ssh/id_rsa
+EOF
+			chmod 400 /root/.ssh/config
+
+			# Clone repository
+			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			cd /workspace/source
+			git checkout ` + app.Spec.Git.Branch + `
+			git rev-parse HEAD > /workspace/git-commit/sha`,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "source",
+				MountPath: "/workspace/source",
+			},
+			{
+				Name:      "git-commit",
+				MountPath: "/workspace/git-commit",
+			},
+		},
+	}
+
+	// Add SSH key volume and update git clone container for private repositories
+	if app.Spec.Git.SecretName != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "ssh-key",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  app.Spec.Git.SecretName,
+					DefaultMode: pointer.Int32(0400),
+				},
+			},
+		})
+
+		// Use bitnami/git which has better SSH support
+		gitCloneContainer.Image = "bitnami/git:latest"
+		gitCloneContainer.Args = []string{
+			`set -e
+			mkdir -p /root/.ssh
+			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+			chmod 400 /root/.ssh/id_rsa
+			ssh-keyscan -H github.com > /root/.ssh/known_hosts
+			chmod 400 /root/.ssh/known_hosts
+
+			# Configure SSH to use the key
+			cat > /root/.ssh/config << EOF
+Host github.com
+    StrictHostKeyChecking no
+    IdentityFile /root/.ssh/id_rsa
+EOF
+			chmod 400 /root/.ssh/config
+
+			# Clone repository
+			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			cd /workspace/source
+			git checkout ` + app.Spec.Git.Branch + `
+			git rev-parse HEAD > /workspace/git-commit/sha`,
+		}
+		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
+			Name:      "ssh-key",
+			MountPath: "/ssh-key",
+		})
+	}
+
 	// Create Kaniko job
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -649,38 +800,7 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					InitContainers: []corev1.Container{
-						{
-							Name:    "git-clone",
-							Image:   "alpine/git:latest",
-							Command: []string{"/bin/sh", "-c"},
-							Args: []string{
-								fmt.Sprintf(`
-									git clone --branch %s %s /workspace/source
-									cd /workspace/source
-									git rev-parse HEAD > /workspace/git-commit
-								`, app.Spec.Git.Branch, app.Spec.Git.URL),
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("64Mi"),
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("128Mi"),
-									corev1.ResourceCPU:    resource.MustParse("200m"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "source",
-									MountPath: "/workspace/source",
-								},
-								{
-									Name:      "git-commit",
-									MountPath: "/workspace/git-commit",
-								},
-							},
-						},
+						gitCloneContainer,
 					},
 					Containers: []corev1.Container{
 						{
@@ -724,90 +844,26 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 							},
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "registry-creds",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: registrySecret,
-									Items: []corev1.KeyToPath{
-										{
-											Key:  ".dockerconfigjson",
-											Path: "config.json",
-										},
-									},
-								},
-							},
-						},
-						{
-							Name: "source",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "cache",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: fmt.Sprintf("kaniko-cache-%s", app.Name),
-								},
-							},
-						},
-						{
-							Name: "git-commit",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-					},
+					Volumes: volumes,
+					Affinity: func() *corev1.Affinity {
+						if build.Spec.BuildNodeAffinity == nil {
+							return nil
+						}
+						return &corev1.Affinity{
+							NodeAffinity: build.Spec.BuildNodeAffinity,
+						}
+					}(),
 				},
 			},
 		},
 	}
 
-	// Add SSH key volume for private repositories if needed
-	if app.Spec.Git.SecretName != "" {
-		job.Spec.Template.Spec.Volumes = append(
-			job.Spec.Template.Spec.Volumes,
-			corev1.Volume{
-				Name: "ssh-key",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  app.Spec.Git.SecretName,
-						DefaultMode: pointer.Int32(0400),
-					},
-				},
-			},
-		)
-
-		// Update git clone container for SSH
-		job.Spec.Template.Spec.InitContainers[0].Command = []string{"/bin/sh", "-c"}
-		job.Spec.Template.Spec.InitContainers[0].Args = []string{
-			`mkdir -p /tmp/.ssh
-			cp /root/.ssh/ssh-privatekey /tmp/.ssh/id_rsa
-			chmod 400 /tmp/.ssh/id_rsa
-			GIT_SSH_COMMAND="ssh -i /tmp/.ssh/id_rsa -o StrictHostKeyChecking=no" git clone --branch ` +
-				app.Spec.Git.Branch + " " + app.Spec.Git.URL + " /workspace/source\n" +
-				"cd /workspace/source\n" +
-				"git rev-parse HEAD > /workspace/git-commit",
-		}
-		job.Spec.Template.Spec.InitContainers[0].VolumeMounts = append(
-			job.Spec.Template.Spec.InitContainers[0].VolumeMounts,
-			corev1.VolumeMount{
-				Name:      "ssh-key",
-				MountPath: "/root/.ssh",
-			},
-		)
-	}
-
 	// Try to get existing job
 	existingJob := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{
+	if err := r.Get(ctx, types.NamespacedName{
 		Name:      build.Name,
 		Namespace: build.Namespace,
-	}, existingJob)
-
-	if err != nil {
+	}, existingJob); err != nil {
 		if !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to check for existing job: %v", err)
 		}
@@ -818,22 +874,21 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 				"appName", app.Name)
 			return fmt.Errorf("failed to create Kaniko job: %v", err)
 		}
-	} else {
-		// Job exists, check if it's failed
-		if isJobFinished(existingJob) {
-			for _, condition := range existingJob.Status.Conditions {
-				if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-					// Only recreate if the job failed
-					if err := r.Delete(ctx, existingJob); err != nil {
-						return fmt.Errorf("failed to delete failed job: %v", err)
-					}
-					if err := r.Create(ctx, job); err != nil {
-						log.Error(err, "Failed to create new Kaniko job",
-							"buildName", build.Name,
-							"appName", app.Name)
-						return fmt.Errorf("failed to create new Kaniko job: %v", err)
-					}
+	} else if isJobFinished(existingJob) {
+		// Job exists and is finished, check if it failed
+		for _, condition := range existingJob.Status.Conditions {
+			if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+				// Only recreate if the job failed
+				if err := r.Delete(ctx, existingJob); err != nil {
+					return fmt.Errorf("failed to delete failed job: %v", err)
 				}
+				if err := r.Create(ctx, job); err != nil {
+					log.Error(err, "Failed to create new Kaniko job",
+						"buildName", build.Name,
+						"appName", app.Name)
+					return fmt.Errorf("failed to create new Kaniko job: %v", err)
+				}
+				break
 			}
 		}
 	}
@@ -917,6 +972,154 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 		return fmt.Errorf("failed to create cache: %v", err)
 	}
 
+	// Create base volumes list
+	volumes := []corev1.Volume{
+		{
+			Name: "source",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "cache",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: fmt.Sprintf("cache-%s", app.Name),
+				},
+			},
+		},
+		{
+			Name: "layers",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: resource.NewQuantity(2*1024*1024*1024, resource.BinarySI), // 2Gi
+				},
+			},
+		},
+		{
+			Name: "platform",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "registry-creds",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: func() string {
+						if app.Spec.Registry.SecretName != "" {
+							return app.Spec.Registry.SecretName
+						}
+						return "registry-creds"
+					}(),
+					Items: []corev1.KeyToPath{
+						{
+							Key:  ".dockerconfigjson",
+							Path: "config.json",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "git-commit",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
+
+	// Create base git-clone container
+	gitCloneContainer := corev1.Container{
+		Name:    "git-clone",
+		Image:   "bitnami/git:latest",
+		Command: []string{"/bin/sh", "-c"},
+		Args: []string{
+			`set -e
+			mkdir -p /root/.ssh
+			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+			chmod 400 /root/.ssh/id_rsa
+			ssh-keyscan -H github.com > /root/.ssh/known_hosts
+			chmod 400 /root/.ssh/known_hosts
+
+			# Configure SSH to use the key
+			cat > /root/.ssh/config << EOF
+Host github.com
+    StrictHostKeyChecking no
+    IdentityFile /root/.ssh/id_rsa
+EOF
+			chmod 400 /root/.ssh/config
+
+			# Clone repository
+			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			cd /workspace/source
+			git checkout ` + build.Spec.GitRef + `
+			git rev-parse HEAD > /workspace/git-commit/sha`,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "source",
+				MountPath: "/workspace/source",
+			},
+			{
+				Name:      "git-commit",
+				MountPath: "/workspace/git-commit",
+			},
+		},
+	}
+
+	// Add SSH key volume and update git clone container for private repositories
+	if app.Spec.Git.SecretName != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "ssh-key",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  app.Spec.Git.SecretName,
+					DefaultMode: pointer.Int32(0400),
+				},
+			},
+		})
+
+		// Use bitnami/git which has better SSH support
+		gitCloneContainer.Image = "bitnami/git:latest"
+		gitCloneContainer.Args = []string{
+			`set -e
+	mkdir -p /root/.ssh
+	cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+	chmod 400 /root/.ssh/id_rsa
+	ssh-keyscan -H github.com > /root/.ssh/known_hosts
+	chmod 400 /root/.ssh/known_hosts
+
+	# Configure SSH to use the key
+	cat > /root/.ssh/config << EOF
+Host github.com
+    StrictHostKeyChecking no
+    IdentityFile /root/.ssh/id_rsa
+EOF
+	chmod 400 /root/.ssh/config
+
+	# Clone repository
+	git clone ` + app.Spec.Git.URL + ` /workspace/source
+	cd /workspace/source
+	git checkout ` + build.Spec.GitRef + `
+	git rev-parse HEAD > /workspace/git-commit/sha`,
+		}
+		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
+			Name:      "ssh-key",
+			MountPath: "/ssh-key",
+		})
+	}
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      build.Name,
@@ -939,6 +1142,14 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
+					Affinity: func() *corev1.Affinity {
+						if build.Spec.BuildNodeAffinity == nil {
+							return nil
+						}
+						return &corev1.Affinity{
+							NodeAffinity: build.Spec.BuildNodeAffinity,
+						}
+					}(),
 					InitContainers: []corev1.Container{
 						{
 							Name:    "setup-platform",
@@ -962,38 +1173,7 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 								},
 							},
 						},
-						{
-							Name:    "git-clone",
-							Image:   "alpine/git:latest",
-							Command: []string{"/bin/sh", "-c"},
-							Args: []string{
-								fmt.Sprintf(`
-									git clone --branch %s %s /workspace/source
-									cd /workspace/source
-									git rev-parse HEAD > /workspace/git-commit
-								`, build.Spec.GitRef, app.Spec.Git.URL),
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("64Mi"),
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceMemory: resource.MustParse("128Mi"),
-									corev1.ResourceCPU:    resource.MustParse("200m"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "source",
-									MountPath: "/workspace/source",
-								},
-								{
-									Name:      "git-commit",
-									MountPath: "/workspace/git-commit",
-								},
-							},
-						},
+						gitCloneContainer,
 					},
 					Containers: []corev1.Container{
 						{
@@ -1031,52 +1211,10 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 							VolumeMounts: r.getBuildpackVolumeMounts(),
 						},
 					},
-					Volumes: append(r.getBuildVolumes(app),
-						corev1.Volume{
-							Name: "git-commit",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-					),
+					Volumes: volumes,
 				},
 			},
 		},
-	}
-
-	// Add SSH key volume for private repositories if needed
-	if app.Spec.Git.SecretName != "" {
-		job.Spec.Template.Spec.Volumes = append(
-			job.Spec.Template.Spec.Volumes,
-			corev1.Volume{
-				Name: "ssh-key",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  app.Spec.Git.SecretName,
-						DefaultMode: pointer.Int32(0400),
-					},
-				},
-			},
-		)
-
-		// Update git clone container for SSH
-		job.Spec.Template.Spec.InitContainers[1].Command = []string{"/bin/sh", "-c"}
-		job.Spec.Template.Spec.InitContainers[1].Args = []string{
-			`mkdir -p /tmp/.ssh
-			cp /root/.ssh/ssh-privatekey /tmp/.ssh/id_rsa
-			chmod 400 /tmp/.ssh/id_rsa
-			GIT_SSH_COMMAND="ssh -i /tmp/.ssh/id_rsa -o StrictHostKeyChecking=no" git clone --branch ` +
-				build.Spec.GitRef + " " + app.Spec.Git.URL + " /workspace/source\n" +
-				"cd /workspace/source\n" +
-				"git rev-parse HEAD > /workspace/git-commit",
-		}
-		job.Spec.Template.Spec.InitContainers[1].VolumeMounts = append(
-			job.Spec.Template.Spec.InitContainers[1].VolumeMounts,
-			corev1.VolumeMount{
-				Name:      "ssh-key",
-				MountPath: "/root/.ssh",
-			},
-		)
 	}
 
 	// Use Create instead of CreateOrPatch for job creation
@@ -1260,7 +1398,15 @@ func (r *AppBuildReconciler) CreateOrPatch(ctx context.Context, obj client.Objec
 func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	// Validate required fields
+	// Add debug logging
+	log.Info("Received app and build objects",
+		"app", app != nil,
+		"build", build != nil,
+		"appName", app.Name,
+		"buildName", build.Name,
+		"buildNamespace", build.Namespace)
+
+	// Existing validation
 	if app == nil {
 		return fmt.Errorf("app is nil")
 	}
@@ -1274,12 +1420,10 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		return fmt.Errorf("build namespace is empty")
 	}
 
-	// First try to get existing HelmChart
-	existing := &helmv1.HelmChart{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      app.Name,
-		Namespace: build.Namespace,
-	}, existing)
+	log.Info("Creating/Updating HelmChart",
+		"app", app.Name,
+		"namespace", build.Namespace,
+		"buildName", build.Name)
 
 	// Default values for nxs-universal-chart
 	defaultValues := map[string]interface{}{}
@@ -1330,6 +1474,13 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 			ValuesContent:   string(valuesYAML),
 		},
 	}
+
+	// First try to get existing HelmChart
+	existing := &helmv1.HelmChart{}
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      app.Name,
+		Namespace: build.Namespace,
+	}, existing)
 
 	// Create new HelmChart if it doesn't exist
 	if err != nil {

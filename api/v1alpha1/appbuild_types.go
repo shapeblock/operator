@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -39,6 +40,11 @@ type AppBuildSpec struct {
 
 	// HelmValues for deployment
 	HelmValues *runtime.RawExtension `json:"helmValues,omitempty"`
+
+	// BuildNodeAffinity defines the node affinity settings for build jobs
+	// This affects where Kaniko and Buildpack jobs are scheduled
+	// +kubebuilder:validation:Optional
+	BuildNodeAffinity *corev1.NodeAffinity `json:"buildNodeAffinity,omitempty"`
 }
 
 type SourceSpec struct {
@@ -84,6 +90,12 @@ type AppBuildStatus struct {
 
 	// Image tag for the built container
 	ImageTag string `json:"imageTag,omitempty"`
+
+	// Time when the actual build process started (when pod starts running)
+	BuildStartTime *metav1.Time `json:"buildStartTime,omitempty"`
+
+	// Time when the build process completed (before deployment phase)
+	BuildEndTime *metav1.Time `json:"buildEndTime,omitempty"`
 
 	// Timestamps
 	StartTime      *metav1.Time `json:"startTime,omitempty"`
