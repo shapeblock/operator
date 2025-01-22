@@ -220,6 +220,54 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 }
 
+// Handle git clone container failures and return appropriate error message
+func (r *AppBuildReconciler) handleGitCloneFailure(ctx context.Context, pod *corev1.Pod, build *appsv1alpha1.AppBuild, job *batchv1.Job) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	for _, initStatus := range pod.Status.InitContainerStatuses {
+		if initStatus.Name == "git-clone" && initStatus.State.Terminated != nil {
+			if initStatus.State.Terminated.ExitCode != 0 {
+				// Get the container logs for detailed error message
+				req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+					Container: "git-clone",
+				})
+				logs, err := req.DoRaw(ctx)
+				if err != nil {
+					log.Error(err, "Failed to get git-clone container logs")
+				}
+
+				errorMsg := string(logs)
+				failureReason := "Git clone failed"
+
+				// Analyze logs for specific error patterns
+				switch {
+				case strings.Contains(errorMsg, "Permission denied (publickey)"):
+					failureReason = "Invalid Git credentials: SSH key authentication failed"
+				case strings.Contains(errorMsg, "Repository not found"):
+					failureReason = "Repository not found: Please check the repository URL"
+				case strings.Contains(errorMsg, "did not match any file(s) known to git"):
+					failureReason = fmt.Sprintf("Branch or reference '%s' not found in repository", build.Spec.GitRef)
+				case strings.Contains(errorMsg, "couldn't find remote ref"):
+					failureReason = fmt.Sprintf("Git reference '%s' not found", build.Spec.GitRef)
+				case strings.Contains(errorMsg, "fatal: Could not read from remote repository"):
+					failureReason = "Unable to connect to Git repository: Connection failed"
+				}
+
+				// Delete the failed job
+				background := metav1.DeletePropagationBackground
+				if err := r.Delete(ctx, job, &client.DeleteOptions{
+					PropagationPolicy: &background,
+				}); err != nil && !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete failed job")
+				}
+
+				return r.failBuild(ctx, build, fmt.Sprintf("%s\nDetails: %s", failureReason, errorMsg))
+			}
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
 func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -258,6 +306,11 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 	}
 
 	pod := &pods.Items[0]
+
+	// Check git-clone init container status for failures
+	if result, err := r.handleGitCloneFailure(ctx, pod, build, job); err != nil {
+		return result, err
+	}
 
 	// Update status and stream logs when pod is running
 	if pod.Status.Phase == corev1.PodRunning {
@@ -403,6 +456,11 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 	}
 
 	pod := &pods.Items[0]
+
+	// Check git-clone init container status for failures
+	if result, err := r.handleGitCloneFailure(ctx, pod, build, job); err != nil {
+		return result, err
+	}
 
 	// Update status and stream logs when pod is running
 	if pod.Status.Phase == corev1.PodRunning {
@@ -1094,25 +1152,25 @@ EOF
 		gitCloneContainer.Image = "bitnami/git:latest"
 		gitCloneContainer.Args = []string{
 			`set -e
-	mkdir -p /root/.ssh
-	cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
-	chmod 400 /root/.ssh/id_rsa
-	ssh-keyscan -H github.com > /root/.ssh/known_hosts
-	chmod 400 /root/.ssh/known_hosts
+			mkdir -p /root/.ssh
+			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+			chmod 400 /root/.ssh/id_rsa
+			ssh-keyscan -H github.com > /root/.ssh/known_hosts
+			chmod 400 /root/.ssh/known_hosts
 
-	# Configure SSH to use the key
-	cat > /root/.ssh/config << EOF
+			# Configure SSH to use the key
+			cat > /root/.ssh/config << EOF
 Host github.com
     StrictHostKeyChecking no
     IdentityFile /root/.ssh/id_rsa
 EOF
-	chmod 400 /root/.ssh/config
+			chmod 400 /root/.ssh/config
 
-	# Clone repository
-	git clone ` + app.Spec.Git.URL + ` /workspace/source
-	cd /workspace/source
-	git checkout ` + build.Spec.GitRef + `
-	git rev-parse HEAD > /workspace/git-commit/sha`,
+			# Clone repository
+			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			cd /workspace/source
+			git checkout ` + build.Spec.GitRef + `
+			git rev-parse HEAD > /workspace/git-commit/sha`,
 		}
 		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
 			Name:      "ssh-key",
