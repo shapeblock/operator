@@ -287,7 +287,7 @@ status:
 Handles the build process.
 
 # TODOs
-- [ ] identify patchable fields in app and appbuild CR
+- [x] identify patchable fields in app and appbuild CR
 - [x] service CR
 - [x] test dockerfile build
 - [x] kaniko cache
@@ -296,9 +296,10 @@ Handles the build process.
 - [x] test pre-built image build
 - [x] Add resource limits to appbuild job
 - [ ] image reuse
+- [ ] failure scenarios
 - [ ] identify and optimize websocket flow
 - [x] test private repo creation(and deletion)
 - [x] previous image as status field for App CR
 - [ ] create a github action for the controller
 - [x] record build timestamps in appbuild CR
-- [ ] add labels to appbuild job
+- [x] add labels to appbuild job

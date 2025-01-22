@@ -103,7 +103,7 @@ func (w *WebsocketClient) connectionManager() {
 	}
 	backoff.Reset()
 
-	ticker := time.NewTicker(30 * time.Second) // Heartbeat interval
+	ticker := time.NewTicker(20 * time.Second) // Heartbeat interval
 	defer ticker.Stop()
 
 	for {
@@ -142,7 +142,6 @@ func (w *WebsocketClient) connect() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		// Add TLS configuration if needed
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
@@ -208,6 +207,7 @@ func (w *WebsocketClient) heartbeat(ticker *time.Ticker, done chan struct{}) {
 				return
 			}
 
+			// Send WebSocket ping frame instead of JSON message
 			err := w.conn.WriteControl(
 				websocket.PingMessage,
 				[]byte{},

@@ -23,27 +23,34 @@ import (
 )
 
 // AppBuildSpec defines the desired state of AppBuild
+// +kubebuilder:validation:XValidation:rule="has(self.gitRef) != has(self.imageTag)", message="Exactly one of gitRef or imageTag must be specified"
 type AppBuildSpec struct {
 	// AppName references the App CR
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Immutable
 	AppName string `json:"appName"`
 
 	// Git reference to build (commit, branch, tag)
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Immutable
 	GitRef string `json:"gitRef,omitempty"`
 
 	// ImageTag for this specific build
-	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Immutable
 	ImageTag string `json:"imageTag,omitempty"`
 
 	// Additional build environment variables
+	// +kubebuilder:validation:Immutable
 	BuildVars []BuildVar `json:"buildVars,omitempty"`
 
 	// HelmValues for deployment
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Immutable
 	HelmValues *runtime.RawExtension `json:"helmValues,omitempty"`
 
 	// BuildNodeAffinity defines the node affinity settings for build jobs
 	// This affects where Kaniko and Buildpack jobs are scheduled
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Immutable
 	BuildNodeAffinity *corev1.NodeAffinity `json:"buildNodeAffinity,omitempty"`
 }
 
@@ -65,9 +72,13 @@ type GitSource struct {
 
 type BuildVar struct {
 	// Name of the build variable
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Immutable
 	Key string `json:"key"`
 
 	// Value of the build variable
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Immutable
 	Value string `json:"value"`
 }
 

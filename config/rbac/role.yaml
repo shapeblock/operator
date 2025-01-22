@@ -5,9 +5,17 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps.shapeblock.io
   resources:
-  - apps
   - appbuilds
   - projects
   - services
@@ -22,7 +30,6 @@ rules:
 - apiGroups:
   - apps.shapeblock.io
   resources:
-  - apps/finalizers
   - appbuilds/finalizers
   - projects/finalizers
   verbs:
@@ -30,7 +37,6 @@ rules:
 - apiGroups:
   - apps.shapeblock.io
   resources:
-  - apps/status
   - appbuilds/status
   - projects/status
   - services/status
@@ -54,6 +60,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - pods
   - secrets
   verbs:
   - create
@@ -66,14 +73,10 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - persistentvolumeclaims
+  - pods/log
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - helm.cattle.io
@@ -86,28 +89,4 @@ rules:
   - list
   - patch
   - update
-  - watch
-- apiGroups:
-  - helm.cattle.io
-  resources:
-  - helmchartversions
-  - helmchartversions/finalizers
-  - helmchartversions/status
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  - pods/log
-  verbs:
-  - create
-  - get
-  - list
   - watch
