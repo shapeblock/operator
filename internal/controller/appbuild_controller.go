@@ -220,6 +220,78 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 }
 
+// Handle insufficient resources for build pods
+func (r *AppBuildReconciler) handleInsufficientResources(ctx context.Context, pod *corev1.Pod, build *appsv1alpha1.AppBuild, job *batchv1.Job) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Check if pod is pending
+	if pod.Status.Phase == corev1.PodPending {
+		// Check if we've been waiting too long (10 minutes)
+		if build.Status.StartTime != nil && time.Since(build.Status.StartTime.Time) > 10*time.Minute {
+			// Get the pending pod's events for detailed error message
+			eventList := &corev1.EventList{}
+			if err := r.List(ctx, eventList,
+				client.InNamespace(pod.Namespace),
+				client.MatchingFields{"involvedObject.name": pod.Name}); err != nil {
+				log.Error(err, "Failed to get pod events")
+			}
+
+			var resourceIssues []string
+			for _, event := range eventList.Items {
+				if strings.Contains(event.Message, "Insufficient memory") ||
+					strings.Contains(event.Message, "Insufficient cpu") ||
+					strings.Contains(event.Message, "OutOf") {
+					resourceIssues = append(resourceIssues, event.Message)
+				}
+			}
+
+			if len(resourceIssues) > 0 {
+				failureMsg := "Build failed due to insufficient cluster resources after waiting for 10 minutes.\n"
+				failureMsg += "Resource issues:\n- " + strings.Join(resourceIssues, "\n- ")
+				failureMsg += "\nPlease check your resource requests/limits or cluster capacity."
+
+				// Delete the failed job
+				background := metav1.DeletePropagationBackground
+				if err := r.Delete(ctx, job, &client.DeleteOptions{
+					PropagationPolicy: &background,
+				}); err != nil && !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete failed job")
+				}
+
+				return r.failBuild(ctx, build, failureMsg)
+			}
+		}
+
+		// Check current pod conditions for resource issues
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+				if strings.Contains(condition.Message, "Insufficient memory") ||
+					strings.Contains(condition.Message, "Insufficient cpu") {
+
+					// If we haven't been waiting long, give it more time
+					if build.Status.StartTime == nil || time.Since(build.Status.StartTime.Time) <= 10*time.Minute {
+						log.Info("Waiting for resources to become available",
+							"buildName", build.Name,
+							"message", condition.Message,
+							"waitTime", time.Since(build.Status.StartTime.Time))
+
+						// Update status to show we're waiting for resources
+						if build.Status.Message != "Waiting for compute resources" {
+							build.Status.Message = "Waiting for compute resources"
+							if err := r.Status().Update(ctx, build); err != nil {
+								log.Error(err, "Failed to update build status")
+							}
+						}
+						return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+					}
+				}
+			}
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
 // Handle git clone container failures and return appropriate error message
 func (r *AppBuildReconciler) handleGitCloneFailure(ctx context.Context, pod *corev1.Pod, build *appsv1alpha1.AppBuild, job *batchv1.Job) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
@@ -268,6 +340,41 @@ func (r *AppBuildReconciler) handleGitCloneFailure(ctx context.Context, pod *cor
 	return ctrl.Result{}, nil
 }
 
+// Handle build failures and return appropriate error message
+func (r *AppBuildReconciler) handleBuildFailure(ctx context.Context, pod *corev1.Pod, build *appsv1alpha1.AppBuild, job *batchv1.Job) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	if job.Status.Failed > 0 {
+		if build.Status.Phase != "Failed" {
+			// Stream final logs synchronously to capture failure details
+			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
+				log.Error(err, "Failed to capture final logs")
+			}
+
+			build.Status.Phase = "Failed"
+			build.Status.Message = "Build failed"
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Delete the failed job
+			background := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{
+				PropagationPolicy: &background,
+			}); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete failed job")
+			}
+			return ctrl.Result{}, nil
+		}
+		// If we're already in Failed phase, no need to requeue
+		return ctrl.Result{}, nil
+	}
+
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
 func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
@@ -306,6 +413,11 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 	}
 
 	pod := &pods.Items[0]
+
+	// Check for insufficient resources
+	if result, err := r.handleInsufficientResources(ctx, pod, build, job); err != nil {
+		return result, err
+	}
 
 	// Check git-clone init container status for failures
 	if result, err := r.handleGitCloneFailure(ctx, pod, build, job); err != nil {
@@ -387,37 +499,8 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 		return ctrl.Result{}, nil
 	}
 
-	// Check if job failed
-	if job.Status.Failed > 0 {
-		if build.Status.Phase != "Failed" {
-			// Stream final logs synchronously to capture failure details
-			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
-				log.Error(err, "Failed to capture final logs")
-			}
-
-			build.Status.Phase = "Failed"
-			build.Status.Message = "Build failed"
-			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
-			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
-			if err := r.Status().Update(ctx, build); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			// Delete the failed job
-			background := metav1.DeletePropagationBackground
-			if err := r.Delete(ctx, job, &client.DeleteOptions{
-				PropagationPolicy: &background,
-			}); err != nil && !errors.IsNotFound(err) {
-				log.Error(err, "Failed to delete failed job")
-			}
-
-			return ctrl.Result{}, nil
-		}
-		// If we're already in Failed phase, no need to requeue
-		return ctrl.Result{}, nil
-	}
-
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	// Check for build failures
+	return r.handleBuildFailure(ctx, pod, build, job)
 }
 
 func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
@@ -456,6 +539,11 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 	}
 
 	pod := &pods.Items[0]
+
+	// Check for insufficient resources
+	if result, err := r.handleInsufficientResources(ctx, pod, build, job); err != nil {
+		return result, err
+	}
 
 	// Check git-clone init container status for failures
 	if result, err := r.handleGitCloneFailure(ctx, pod, build, job); err != nil {
@@ -509,7 +597,7 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
-			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
+			build.Status.ImageTag = build.Spec.ImageTag
 			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
@@ -525,28 +613,11 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 			}
 			return ctrl.Result{}, nil
 		}
+		return ctrl.Result{}, nil
 	}
 
-	// Check if job failed
-	if job.Status.Failed > 0 {
-		if build.Status.Phase != "Failed" {
-			// Stream final logs synchronously to capture failure details
-			if err := r.streamFinalLogs(ctx, build, pod); err != nil {
-				log.Error(err, "Failed to capture final logs")
-			}
-
-			build.Status.Phase = "Failed"
-			build.Status.Message = "Build failed"
-			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
-			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
-			if err := r.Status().Update(ctx, build); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-	}
-
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	// Check for build failures
+	return r.handleBuildFailure(ctx, pod, build, job)
 }
 
 func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv1alpha1.AppBuild, pod *corev1.Pod) (ctrl.Result, error) {
@@ -593,7 +664,6 @@ func (r *AppBuildReconciler) updateBuildStatus(ctx context.Context, build *appsv
 			}
 			return ctrl.Result{}, nil
 		}
-
 	case corev1.PodFailed:
 		if build.Status.Phase != "Failed" {
 			build.Status.Phase = "Failed"
