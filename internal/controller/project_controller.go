@@ -68,7 +68,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Create namespace if it doesn't exist
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: project.Spec.Name,
+			Name: project.Name,
 			Labels: map[string]string{
 				"shapeblock.io/project-id": project.Name,
 				"shapeblock.io/managed-by": "shapeblock-operator",
@@ -81,10 +81,10 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			log.Error(err, "Failed to create namespace")
 			return r.failProject(ctx, project, fmt.Sprintf("Failed to create namespace: %v", err))
 		}
-		log.Info("Namespace already exists", "namespace", project.Spec.Name)
+		log.Info("Namespace already exists", "namespace", project.Name)
 	} else {
 		log.Info("Successfully created namespace",
-			"namespace", project.Spec.Name,
+			"namespace", project.Name,
 			"projectId", project.Name)
 	}
 
@@ -103,7 +103,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log.Info("Successfully copied registry secret",
 		"from", registrySecretName,
 		"to", "registry-creds",
-		"namespace", project.Spec.Name)
+		"namespace", project.Name)
 
 	// Update status to Active if not already
 	if project.Status.Phase != "Active" {
@@ -145,12 +145,12 @@ func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *app
 	existingSecret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      "registry-creds",
-		Namespace: project.Spec.Name,
+		Namespace: project.Name,
 	}, existingSecret)
 
 	if err == nil {
 		log.Info("Registry secret already exists in namespace, skipping copy",
-			"namespace", project.Spec.Name,
+			"namespace", project.Name,
 			"secretName", "registry-creds")
 		return nil
 	}
@@ -172,7 +172,7 @@ func (r *ProjectReconciler) copyRegistrySecret(ctx context.Context, project *app
 	newSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "registry-creds",
-			Namespace: project.Spec.Name,
+			Namespace: project.Name,
 			Labels: map[string]string{
 				"shapeblock.io/project-id": project.Name,
 				"shapeblock.io/managed-by": "shapeblock-operator",

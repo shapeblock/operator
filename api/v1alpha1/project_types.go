@@ -22,9 +22,6 @@ import (
 
 // ProjectSpec defines the desired state of Project
 type ProjectSpec struct {
-	// Name is the name of the namespace to create
-	Name string `json:"name"`
-
 	// DisplayName is the human-readable name of the project
 	DisplayName string `json:"displayName,omitempty"`
 

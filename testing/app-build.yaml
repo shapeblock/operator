@@ -1,16 +1,15 @@
 apiVersion: apps.shapeblock.io/v1alpha1
 kind: AppBuild
 metadata:
-  name: fl4-build-3
-  namespace: py-dev
+  name: fl-build-1
+  namespace: py-dev2
 spec:
-  appName: "fl4"
+  appName: "fl"
   gitRef: "main"
   imageTag: "v1"
 
   helmValues:
-    defaultImageTag: "v1"
-    releasePrefix: "fl4"
+    releasePrefix: "fl"
 
     deployments:
       python:
@@ -32,7 +31,7 @@ spec:
                 cpu: 5m
                 memory: 128M
         podLabels:
-          release: fl4
+          release: fl
         replicas: 1
 
     envs:
@@ -42,11 +41,11 @@ spec:
       extraImagePullSecrets:
         - name: registry-creds
       labels:
-        release: fl4
+        release: fl
       usePredefinedAffinity: false
 
     ingresses:
-      "py-dev-fl4.without-op.shapeblockapp.com":
+      "py-dev2-fl.without-op.shapeblockapp.com":
         annotations:
           nginx.ingress.kubernetes.io/proxy-body-size: 50m
           nginx.ingress.kubernetes.io/ssl-redirect: "true"
@@ -58,12 +57,13 @@ spec:
               - serviceName: python
                 servicePort: 8080
         ingressClassName: nginx
-        name: my-project
+        name: py-dev2-fl
 
     services:
       python:
         extraSelectorLabels:
-          release: fl4
+          release: fl
         ports:
           - port: 8080
         type: NodePort
+

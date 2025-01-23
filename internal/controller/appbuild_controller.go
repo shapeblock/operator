@@ -962,28 +962,18 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 	// Create base git-clone container
 	gitCloneContainer := corev1.Container{
 		Name:    "git-clone",
-		Image:   "bitnami/git:latest",
+		Image:   "bitnami/git:2",
 		Command: []string{"/bin/sh", "-c"},
 		Args: []string{
 			`set -e
-			mkdir -p /root/.ssh
-			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
-			chmod 400 /root/.ssh/id_rsa
-			ssh-keyscan -H github.com > /root/.ssh/known_hosts
-			chmod 400 /root/.ssh/known_hosts
-
-			# Configure SSH to use the key
-			cat > /root/.ssh/config << EOF
-Host github.com
-    StrictHostKeyChecking no
-    IdentityFile /root/.ssh/id_rsa
-EOF
-			chmod 400 /root/.ssh/config
-
-			# Clone repository
-			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			# Clone repository with specific branch/ref
+			if [ -n "` + build.Spec.GitRef + `" ]; then
+				git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+				(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
+			else
+				git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
+			fi
 			cd /workspace/source
-			git checkout ` + app.Spec.Git.Branch + `
 			git rev-parse HEAD > /workspace/git-commit/sha`,
 		},
 		Resources: corev1.ResourceRequirements{
@@ -1020,8 +1010,7 @@ EOF
 			},
 		})
 
-		// Use bitnami/git which has better SSH support
-		gitCloneContainer.Image = "bitnami/git:latest"
+		// Update container for SSH support
 		gitCloneContainer.Args = []string{
 			`set -e
 			mkdir -p /root/.ssh
@@ -1038,10 +1027,14 @@ Host github.com
 EOF
 			chmod 400 /root/.ssh/config
 
-			# Clone repository
-			git clone ` + app.Spec.Git.URL + ` /workspace/source
+			# Clone repository with specific branch/ref
+			if [ -n "` + build.Spec.GitRef + `" ]; then
+				git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+				(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
+			else
+				git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
+			fi
 			cd /workspace/source
-			git checkout ` + app.Spec.Git.Branch + `
 			git rev-parse HEAD > /workspace/git-commit/sha`,
 		}
 		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
@@ -1082,7 +1075,7 @@ EOF
 					Containers: []corev1.Container{
 						{
 							Name:  "kaniko",
-							Image: "gcr.io/kaniko-project/executor:latest",
+							Image: "gcr.io/kaniko-project/executor:v1.23.2",
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
 									corev1.ResourceMemory: resource.MustParse("512Mi"),
@@ -1314,29 +1307,19 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 	// Create base git-clone container
 	gitCloneContainer := corev1.Container{
 		Name:    "git-clone",
-		Image:   "bitnami/git:latest",
+		Image:   "bitnami/git:2",
 		Command: []string{"/bin/sh", "-c"},
 		Args: []string{
 			`set -e
-			mkdir -p /root/.ssh
-			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
-			chmod 400 /root/.ssh/id_rsa
-			ssh-keyscan -H github.com > /root/.ssh/known_hosts
-			chmod 400 /root/.ssh/known_hosts
-
-			# Configure SSH to use the key
-			cat > /root/.ssh/config << EOF
-Host github.com
-    StrictHostKeyChecking no
-    IdentityFile /root/.ssh/id_rsa
-EOF
-			chmod 400 /root/.ssh/config
-
-			# Clone repository
-			git clone ` + app.Spec.Git.URL + ` /workspace/source
-			cd /workspace/source
-			git checkout ` + build.Spec.GitRef + `
-			git rev-parse HEAD > /workspace/git-commit/sha`,
+				# Clone repository with specific branch/ref
+				if [ -n "` + build.Spec.GitRef + `" ]; then
+					git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+					(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
+				else
+					git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
+				fi
+				cd /workspace/source
+				git rev-parse HEAD > /workspace/git-commit/sha`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -1372,29 +1355,32 @@ EOF
 			},
 		})
 
-		// Use bitnami/git which has better SSH support
-		gitCloneContainer.Image = "bitnami/git:latest"
+		// Update container for SSH support
 		gitCloneContainer.Args = []string{
 			`set -e
-			mkdir -p /root/.ssh
-			cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
-			chmod 400 /root/.ssh/id_rsa
-			ssh-keyscan -H github.com > /root/.ssh/known_hosts
-			chmod 400 /root/.ssh/known_hosts
+				mkdir -p /root/.ssh
+				cp /ssh-key/ssh-privatekey /root/.ssh/id_rsa
+				chmod 400 /root/.ssh/id_rsa
+				ssh-keyscan -H github.com > /root/.ssh/known_hosts
+				chmod 400 /root/.ssh/known_hosts
 
-			# Configure SSH to use the key
-			cat > /root/.ssh/config << EOF
+				# Configure SSH to use the key
+				cat > /root/.ssh/config << EOF
 Host github.com
     StrictHostKeyChecking no
     IdentityFile /root/.ssh/id_rsa
 EOF
-			chmod 400 /root/.ssh/config
+				chmod 400 /root/.ssh/config
 
-			# Clone repository
-			git clone ` + app.Spec.Git.URL + ` /workspace/source
-			cd /workspace/source
-			git checkout ` + build.Spec.GitRef + `
-			git rev-parse HEAD > /workspace/git-commit/sha`,
+				# Clone repository with specific branch/ref
+				if [ -n "` + build.Spec.GitRef + `" ]; then
+					git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+					(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
+				else
+					git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
+				fi
+				cd /workspace/source
+				git rev-parse HEAD > /workspace/git-commit/sha`,
 		}
 		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
 			Name:      "ssh-key",
@@ -1540,73 +1526,6 @@ func (r *AppBuildReconciler) getBuildpackVolumeMounts() []corev1.VolumeMount {
 			ReadOnly:  true,
 		},
 	}
-}
-
-func (r *AppBuildReconciler) getBuildVolumes(app *appsv1alpha1.App) []corev1.Volume {
-	volumes := []corev1.Volume{
-		{
-			Name: "source",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: "cache",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: fmt.Sprintf("cache-%s", app.Name),
-				},
-			},
-		},
-		{
-			Name: "layers",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{
-					SizeLimit: resource.NewQuantity(2*1024*1024*1024, resource.BinarySI), // 2Gi
-				},
-			},
-		},
-		{
-			Name: "platform",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: "registry-creds",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: func() string {
-						if app.Spec.Registry.SecretName != "" {
-							return app.Spec.Registry.SecretName
-						}
-						return "registry-creds"
-					}(),
-					Items: []corev1.KeyToPath{
-						{
-							Key:  ".dockerconfigjson",
-							Path: "config.json",
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// Add SSH key volume for private repositories
-	if app.Spec.Git.SecretName != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: "ssh-key",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName:  app.Spec.Git.SecretName,
-					DefaultMode: pointer.Int32(0400),
-				},
-			},
-		})
-	}
-
-	return volumes
 }
 
 func (r *AppBuildReconciler) generatePlatformScript(buildVars []appsv1alpha1.BuildVar) string {

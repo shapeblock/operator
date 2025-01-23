@@ -1,7 +1,6 @@
 apiVersion: apps.shapeblock.io/v1alpha1
 kind: Project
 metadata:
-  name: py-dev
+  name: py-dev2
 spec:
-  name: "py-dev"
-  description: "A sample project"
+  description: "Test all failure scenarios"

@@ -3,5 +3,5 @@ kind: Project
 metadata:
   name: my-project
 spec:
-  name: "my-project"
   description: "A sample project"
+  displayName: "My Project"

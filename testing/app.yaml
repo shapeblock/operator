@@ -1,11 +1,11 @@
 apiVersion: apps.shapeblock.io/v1alpha1
 kind: App
 metadata:
-  name: fl4
-  namespace: py-dev
+  name: fl
+  namespace: py-dev2
 spec:
-  displayName: "Sample Application"
-  description: "A sample application to demonstrate the App CR"
+  displayName: "Flask"
+  description: "A simple flask app to demonstrate SB operator"
 
   build:
     type: "buildpack"

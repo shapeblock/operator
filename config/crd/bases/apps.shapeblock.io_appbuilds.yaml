@@ -281,8 +281,8 @@ spec:
             - appName
             type: object
             x-kubernetes-validations:
-            - message: Exactly one of gitRef or imageTag must be specified
-              rule: has(self.gitRef) != has(self.imageTag)
+            - message: At least one of gitRef or imageTag must be specified
+              rule: has(self.gitRef) || has(self.imageTag)
           status:
             description: AppBuildStatus defines the observed state of AppBuild
             properties:

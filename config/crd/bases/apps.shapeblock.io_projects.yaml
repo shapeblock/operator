@@ -55,15 +55,10 @@ spec:
               displayName:
                 description: DisplayName is the human-readable name of the project
                 type: string
-              name:
-                description: Name is the name of the namespace to create
-                type: string
               registrySecret:
                 description: RegistrySecret references a secret containing registry
                   credentials
                 type: string
-            required:
-            - name
             type: object
           status:
             description: ProjectStatus defines the observed state of Project
