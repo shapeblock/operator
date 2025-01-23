@@ -457,26 +457,6 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 				log.Error(err, "Failed to capture final logs")
 			}
 
-			// Read Git commit SHA from the file
-			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				Container: "git-clone",
-				Follow:    false,
-			})
-			stream, err := req.Stream(ctx)
-			if err == nil {
-				defer stream.Close()
-				if content, err := io.ReadAll(stream); err == nil {
-					// Extract the commit SHA from the git rev-parse output
-					lines := strings.Split(string(content), "\n")
-					for _, line := range lines {
-						if len(line) == 40 { // Git commit SHA is 40 characters
-							build.Status.GitCommit = line
-							break
-						}
-					}
-				}
-			}
-
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
 			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
@@ -501,10 +481,10 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 				log.Error(err, "Failed to create Helm release")
 				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
 			}
-			return ctrl.Result{}, nil
+			return r.monitorHelmRelease(ctx, app, build)
 		}
-		// If we're already in Deploying/Completed phase, no need to requeue
-		return ctrl.Result{}, nil
+		// If we're already in Deploying/Completed phase, continue monitoring the helm release
+		return r.monitorHelmRelease(ctx, app, build)
 	}
 
 	// Check for build failures
@@ -583,26 +563,6 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 				log.Error(err, "Failed to capture final logs")
 			}
 
-			// Read Git commit SHA from the file
-			req := r.CoreV1Client.Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-				Container: "git-clone",
-				Follow:    false,
-			})
-			stream, err := req.Stream(ctx)
-			if err == nil {
-				defer stream.Close()
-				if content, err := io.ReadAll(stream); err == nil {
-					// Extract the commit SHA from the git rev-parse output
-					lines := strings.Split(string(content), "\n")
-					for _, line := range lines {
-						if len(line) == 40 { // Git commit SHA is 40 characters
-							build.Status.GitCommit = line
-							break
-						}
-					}
-				}
-			}
-
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
 			build.Status.ImageTag = build.Spec.ImageTag
@@ -619,9 +579,10 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 				log.Error(err, "Failed to create Helm release")
 				return r.failBuild(ctx, build, fmt.Sprintf("failed to create helm release: %v", err))
 			}
-			return ctrl.Result{}, nil
+			return r.monitorHelmRelease(ctx, app, build)
 		}
-		return ctrl.Result{}, nil
+		// If we're already in Deploying/Completed phase, continue monitoring the helm release
+		return r.monitorHelmRelease(ctx, app, build)
 	}
 
 	// Check for build failures
@@ -879,7 +840,7 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 
 		// Check if we have a successful build with the same commit
 		for _, existingBuild := range buildList.Items {
-			if existingBuild.Status.GitCommit == build.Spec.GitRef &&
+			if existingBuild.Spec.GitRef == build.Spec.GitRef &&
 				existingBuild.Status.Phase == "Completed" {
 				log.Info("Found existing successful build for commit",
 					"buildName", existingBuild.Name,
@@ -889,7 +850,6 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 				build.Status.Phase = "Deploying"
 				build.Status.Message = fmt.Sprintf("Reusing image from build %s", existingBuild.Name)
 				build.Status.ImageTag = existingBuild.Status.ImageTag
-				build.Status.GitCommit = existingBuild.Status.GitCommit
 				if err := r.Status().Update(ctx, build); err != nil {
 					return fmt.Errorf("failed to update build status: %v", err)
 				}
@@ -951,12 +911,6 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 				},
 			},
 		},
-		{
-			Name: "git-commit",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
 	}
 
 	// Create base git-clone container
@@ -967,14 +921,8 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 		Args: []string{
 			`set -e
 			# Clone repository with specific branch/ref
-			if [ -n "` + build.Spec.GitRef + `" ]; then
-				git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
-				(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
-			else
-				git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
-			fi
-			cd /workspace/source
-			git rev-parse HEAD > /workspace/git-commit/sha`,
+			git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+			(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -990,10 +938,6 @@ func (r *AppBuildReconciler) handleDockerfileBuild(ctx context.Context, app *app
 			{
 				Name:      "source",
 				MountPath: "/workspace/source",
-			},
-			{
-				Name:      "git-commit",
-				MountPath: "/workspace/git-commit",
 			},
 		},
 	}
@@ -1028,14 +972,8 @@ EOF
 			chmod 400 /root/.ssh/config
 
 			# Clone repository with specific branch/ref
-			if [ -n "` + build.Spec.GitRef + `" ]; then
-				git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
-				(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
-			else
-				git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
-			fi
-			cd /workspace/source
-			git rev-parse HEAD > /workspace/git-commit/sha`,
+			git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+			(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)`,
 		}
 		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
 			Name:      "ssh-key",
@@ -1106,10 +1044,6 @@ EOF
 								{
 									Name:      "cache",
 									MountPath: "/cache",
-								},
-								{
-									Name:      "git-commit",
-									MountPath: "/workspace/git-commit",
 								},
 							},
 						},
@@ -1296,12 +1230,6 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 				},
 			},
 		},
-		{
-			Name: "git-commit",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
 	}
 
 	// Create base git-clone container
@@ -1311,15 +1239,9 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 		Command: []string{"/bin/sh", "-c"},
 		Args: []string{
 			`set -e
-				# Clone repository with specific branch/ref
-				if [ -n "` + build.Spec.GitRef + `" ]; then
-					git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
-					(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
-				else
-					git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
-				fi
-				cd /workspace/source
-				git rev-parse HEAD > /workspace/git-commit/sha`,
+			# Clone repository with specific branch/ref
+			git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+			(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
@@ -1335,10 +1257,6 @@ func (r *AppBuildReconciler) handleBuildpackBuild(ctx context.Context, app *apps
 			{
 				Name:      "source",
 				MountPath: "/workspace/source",
-			},
-			{
-				Name:      "git-commit",
-				MountPath: "/workspace/git-commit",
 			},
 		},
 	}
@@ -1372,15 +1290,9 @@ Host github.com
 EOF
 				chmod 400 /root/.ssh/config
 
-				# Clone repository with specific branch/ref
-				if [ -n "` + build.Spec.GitRef + `" ]; then
-					git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
-					(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)
-				else
-					git clone --depth=1 --branch ` + app.Spec.Git.Branch + ` ` + app.Spec.Git.URL + ` /workspace/source
-				fi
-				cd /workspace/source
-				git rev-parse HEAD > /workspace/git-commit/sha`,
+			# Clone repository with specific branch/ref
+			git clone --depth=1 --branch ` + build.Spec.GitRef + ` ` + app.Spec.Git.URL + ` /workspace/source || \
+			(git clone ` + app.Spec.Git.URL + ` /workspace/source && cd /workspace/source && git checkout ` + build.Spec.GitRef + `)`,
 		}
 		gitCloneContainer.VolumeMounts = append(gitCloneContainer.VolumeMounts, corev1.VolumeMount{
 			Name:      "ssh-key",
@@ -1756,6 +1668,10 @@ func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
 func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	log.Info("Monitoring helm release",
+		"appName", app.Name,
+		"buildName", build.Name)
+
 	// If build is already completed, don't requeue
 	if build.Status.Phase == "Completed" {
 		return ctrl.Result{}, nil
@@ -1805,84 +1721,96 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		return r.failBuild(ctx, build, "Helm deployment timed out after 10 minutes. Please check the helm release status and logs.")
 	}
 
+	// Get the HelmChart
 	helmChart := &helmv1.HelmChart{}
-	err := r.Get(ctx, types.NamespacedName{
+	if err := r.Get(ctx, types.NamespacedName{
 		Name:      app.Name,
-		Namespace: build.Namespace,
-	}, helmChart)
-
-	if err != nil {
+		Namespace: app.Namespace,
+	}, helmChart); err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("Waiting for Helm chart to be created",
-				"appName", app.Name)
+			log.Info("Waiting for HelmChart to be created",
+				"appName", app.Name,
+				"buildName", build.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("failed to get HelmChart: %v", err)
 	}
 
 	// If JobName is empty, wait for it to be populated
 	if helmChart.Status.JobName == "" {
 		log.Info("Waiting for helm job to be created",
-			"appName", app.Name)
+			"appName", app.Name,
+			"buildName", build.Name)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Get the helm install/upgrade job
 	job := &batchv1.Job{}
-	err = r.Get(ctx, types.NamespacedName{
+	if err := r.Get(ctx, types.NamespacedName{
 		Name:      helmChart.Status.JobName,
-		Namespace: build.Namespace,
-	}, job)
-
-	if err != nil {
+		Namespace: app.Namespace,
+	}, job); err != nil {
 		if errors.IsNotFound(err) {
+			log.Info("Waiting for helm job to be available",
+				"jobName", helmChart.Status.JobName,
+				"appName", app.Name,
+				"buildName", build.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Check job conditions
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			// Check if all pods are ready
-			podList := &corev1.PodList{}
-			if err := r.List(ctx, podList,
-				client.InNamespace(build.Namespace),
-				client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
-				return ctrl.Result{}, err
-			}
+	// Check if job completed successfully
+	if isJobComplete(job) {
+		// Check if all pods are ready
 
-			if len(podList.Items) == 0 {
-				log.Info("Waiting for application pods to be created",
-					"appName", app.Name)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
+		log.Info("Checking pod readiness",
+			"appName", app.Name,
+			"buildName", build.Name)
 
-			allPodsReady := true
-			var notReadyPods []string
-			var resourceConstrainedPods []string
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList,
+			client.InNamespace(app.Namespace),
+			client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
+			return ctrl.Result{}, err
+		}
 
-			for _, pod := range podList.Items {
-				if pod.Status.Phase == corev1.PodPending {
-					// Check if pending due to resource constraints
-					for _, condition := range pod.Status.Conditions {
-						if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-							if strings.Contains(condition.Message, "Insufficient memory") ||
-								strings.Contains(condition.Message, "Insufficient cpu") {
-								resourceConstrainedPods = append(resourceConstrainedPods,
-									fmt.Sprintf("%s (%s)", pod.Name, condition.Message))
-								allPodsReady = false
-								continue
-							}
+		if len(podList.Items) == 0 {
+			log.Info("Waiting for application pods to be created",
+				"appName", app.Name,
+				"buildName", build.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		allPodsReady := true
+		var notReadyPods []string
+		var resourceConstrainedPods []string
+
+		for _, pod := range podList.Items {
+			if pod.Status.Phase == corev1.PodPending {
+				// Check if pending due to resource constraints
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+						if strings.Contains(condition.Message, "Insufficient memory") ||
+							strings.Contains(condition.Message, "Insufficient cpu") {
+							resourceConstrainedPods = append(resourceConstrainedPods,
+								fmt.Sprintf("%s (%s)", pod.Name, condition.Message))
+							allPodsReady = false
+							continue
 						}
 					}
 				}
+			}
 
-				if pod.Status.Phase != corev1.PodRunning {
-					allPodsReady = false
-					notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Phase: %s)", pod.Name, pod.Status.Phase))
-					continue
-				}
+			// Consider both Running and Succeeded pods as ready states
+			if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded {
+				allPodsReady = false
+				notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Phase: %s)", pod.Name, pod.Status.Phase))
+				continue
+			}
+
+			// Only check pod conditions for Running pods
+			if pod.Status.Phase == corev1.PodRunning {
 				for _, condition := range pod.Status.Conditions {
 					if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
 						allPodsReady = false
@@ -1891,78 +1819,101 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 					}
 				}
 			}
+		}
 
-			if !allPodsReady {
-				statusMsg := "Waiting for application pods to be ready"
-				if len(resourceConstrainedPods) > 0 {
-					statusMsg = "Waiting for compute resources to be available"
-					log.Info("Pods waiting for resources",
-						"appName", app.Name,
-						"buildName", build.Name,
-						"resourceConstrainedPods", strings.Join(resourceConstrainedPods, ", "))
-				}
-
-				log.Info("Waiting for pods to be ready",
+		if !allPodsReady {
+			statusMsg := "Waiting for application pods to be ready"
+			if len(resourceConstrainedPods) > 0 {
+				statusMsg = "Waiting for compute resources to be available"
+				log.Info("Pods waiting for resources",
 					"appName", app.Name,
 					"buildName", build.Name,
-					"notReadyPods", strings.Join(notReadyPods, ", "))
-
-				// Update build status with pod readiness info
-				if build.Status.Message != statusMsg {
-					build.Status.Message = statusMsg
-					if err := r.Status().Update(ctx, build); err != nil {
-						return ctrl.Result{}, err
-					}
-				}
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+					"resourceConstrainedPods", strings.Join(resourceConstrainedPods, ", "))
 			}
 
-			// Only update status if not already completed
-			if build.Status.Phase != "Completed" {
-				log.Info("Helm release completed successfully",
-					"appName", app.Name,
-					"buildName", build.Name)
-				build.Status.Phase = "Completed"
-				build.Status.Message = "Application deployed successfully"
-				build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			log.Info("Waiting for pods to be ready",
+				"appName", app.Name,
+				"buildName", build.Name,
+				"notReadyPods", strings.Join(notReadyPods, ", "))
+
+			// Update build status with pod readiness info
+			if build.Status.Message != statusMsg {
+				build.Status.Message = statusMsg
 				if err := r.Status().Update(ctx, build); err != nil {
 					return ctrl.Result{}, err
 				}
-				r.sendBuildStatus(build)
 			}
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			// Get the helm job pod for logs
-			helmPods := &corev1.PodList{}
-			if err := r.List(ctx, helmPods,
-				client.InNamespace(build.Namespace),
-				client.MatchingLabels{"job-name": job.Name}); err != nil {
-				log.Error(err, "Failed to get helm job pods")
-			}
+		log.Info("All pods are ready",
+			"appName", app.Name,
+			"buildName", build.Name)
 
-			failureMsg := "Helm release failed"
-			if len(helmPods.Items) > 0 {
-				// Get the logs from the helm job pod
-				req := r.CoreV1Client.Pods(build.Namespace).GetLogs(helmPods.Items[0].Name, &corev1.PodLogOptions{})
-				logs, err := req.DoRaw(ctx)
-				if err != nil {
-					log.Error(err, "Failed to get helm job logs")
-				} else {
-					failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
-				}
-			}
-
-			log.Error(nil, "Helm release failed",
+		// Only update status if not already completed
+		if build.Status.Phase != "Completed" {
+			log.Info("Helm release completed successfully",
 				"appName", app.Name,
-				"buildName", build.Name,
-				"message", failureMsg)
-			return r.failBuild(ctx, build, failureMsg)
+				"buildName", build.Name)
+			build.Status.Phase = "Completed"
+			build.Status.Message = "Application deployed successfully"
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.sendBuildStatus(build)
 		}
+		return ctrl.Result{}, nil
+	} else if isJobFailed(job) {
+		// Get the helm job pod for logs
+		helmPods := &corev1.PodList{}
+		if err := r.List(ctx, helmPods,
+			client.InNamespace(app.Namespace),
+			client.MatchingLabels{"job-name": job.Name}); err != nil {
+			log.Error(err, "Failed to get helm job pods")
+		}
+
+		failureMsg := "Helm release failed"
+		if len(helmPods.Items) > 0 {
+			// Get the logs from the helm job pod
+			req := r.CoreV1Client.Pods(app.Namespace).GetLogs(helmPods.Items[0].Name, &corev1.PodLogOptions{})
+			logs, err := req.DoRaw(ctx)
+			if err != nil {
+				log.Error(err, "Failed to get helm job logs")
+			} else {
+				failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
+			}
+		}
+
+		return r.failBuild(ctx, build, failureMsg)
 	}
 
+	// Still waiting for job to complete
+	log.Info("Waiting for helm job to complete",
+		"jobName", job.Name,
+		"appName", app.Name,
+		"buildName", build.Name)
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// Helper function to check if a job completed successfully
+func isJobComplete(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to check if a job failed
+func isJobFailed(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *AppBuildReconciler) handleDeletion(ctx context.Context, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {

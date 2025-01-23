@@ -30,7 +30,7 @@ type AppBuildSpec struct {
 	// +kubebuilder:validation:Immutable
 	AppName string `json:"appName"`
 
-	// Git reference to build (commit, branch, tag)
+	// Git reference to build (commit SHA)
 	// +kubebuilder:validation:Immutable
 	GitRef string `json:"gitRef,omitempty"`
 

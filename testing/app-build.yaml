@@ -36,12 +36,14 @@ spec:
 
     envs:
       PORT: "8080"
+      FOO: "bar1"
 
     generic:
       extraImagePullSecrets:
         - name: registry-creds
       labels:
         release: fl
+        timestamp: "1737611778"
       usePredefinedAffinity: false
 
     ingresses:
