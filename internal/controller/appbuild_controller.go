@@ -119,6 +119,34 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		buildCopy.Status.Phase = "Pending"
 		buildCopy.Status.StartTime = &metav1.Time{Time: time.Now()}
 
+		// If neither gitRef nor imageTag is specified, find the most recent successful build
+		if build.Spec.GitRef == "" && build.Spec.ImageTag == "" {
+			buildList := &appsv1alpha1.AppBuildList{}
+			if err := r.List(ctx, buildList,
+				client.InNamespace(build.Namespace),
+				client.MatchingFields{"spec.appName": build.Spec.AppName},
+				client.MatchingFields{"status.phase": "Completed"}); err != nil {
+				return r.failBuild(ctx, build, fmt.Sprintf("failed to list previous builds: %v", err))
+			}
+
+			var latestBuild *appsv1alpha1.AppBuild
+			for i := range buildList.Items {
+				if latestBuild == nil || buildList.Items[i].Status.CompletionTime.After(latestBuild.Status.CompletionTime.Time) {
+					latestBuild = &buildList.Items[i]
+				}
+			}
+
+			if latestBuild == nil {
+				return r.failBuild(ctx, build, "no previous successful builds found to reuse image from")
+			}
+
+			// Reuse the image from the latest successful build
+			buildCopy.Status.Phase = "Deploying"
+			buildCopy.Status.Message = fmt.Sprintf("Reusing image from build %s", latestBuild.Name)
+			buildCopy.Status.ImageTag = latestBuild.Status.ImageTag
+			buildCopy.Status.GitCommit = latestBuild.Status.GitCommit
+		}
+
 		// Use Patch instead of Update
 		if err := r.Status().Patch(ctx, buildCopy, client.MergeFrom(build)); err != nil {
 			if errors.IsConflict(err) {
@@ -134,6 +162,14 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			"appName", app.Name,
 			"buildType", app.Spec.Build.Type)
 		r.sendBuildStatus(buildCopy)
+
+		// If we're reusing an image, create the helm release immediately
+		if buildCopy.Status.Phase == "Deploying" {
+			if err := r.createOrUpdateHelmRelease(ctx, app, buildCopy); err != nil {
+				return r.failBuild(ctx, buildCopy, fmt.Sprintf("failed to create helm release: %v", err))
+			}
+			return r.monitorHelmRelease(ctx, app, buildCopy)
+		}
 
 		// Requeue to handle the rest of the reconciliation
 		return ctrl.Result{Requeue: true}, nil

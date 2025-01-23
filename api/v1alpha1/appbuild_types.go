@@ -23,7 +23,6 @@ import (
 )
 
 // AppBuildSpec defines the desired state of AppBuild
-// +kubebuilder:validation:XValidation:rule="has(self.gitRef) || has(self.imageTag)", message="At least one of gitRef or imageTag must be specified"
 type AppBuildSpec struct {
 	// AppName references the App CR
 	// +kubebuilder:validation:Required
