@@ -1,0 +1,19 @@
+{{- if .Values.metrics.service.create }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: sb-controller-manager-metrics-service
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: shapeblock-operator
+spec:
+  type: {{ .Values.metrics.service.type }}
+  ports:
+  - name: https
+    port: {{ .Values.metrics.port }}
+    protocol: TCP
+    targetPort: {{ .Values.metrics.port }}
+  selector:
+    control-plane: controller-manager
+{{- end }}

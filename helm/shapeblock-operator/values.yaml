@@ -1,0 +1,48 @@
+# Operator configuration
+operator:
+  image:
+    repository: ghcr.io/shapeblock/operator
+    tag: v3.69
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+  debug: true
+  websocketUrl: "wss://your-shapeblock-server/ws"
+  apiUrl: "https://your-shapeblock-server/api"
+
+# Credentials configuration
+credentials:
+  apiKey: ""
+  licenseKey: ""
+  licenseEmail: ""
+
+# Service account configuration
+serviceAccount:
+  name: sb-controller-manager
+  create: true
+
+# Metrics configuration
+metrics:
+  port: 8443
+  service:
+    create: true
+    type: ClusterIP
+
+# Health probe configuration
+healthProbe:
+  port: 8081
+  livenessProbe:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# Leader election configuration
+leaderElection:
+  enabled: false

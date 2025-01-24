@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sb-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: shapeblock-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+    spec:
+      containers:
+      - name: manager
+        image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+        imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+        args:
+        - --metrics-bind-address=:{{ .Values.metrics.port }}
+        {{- if .Values.leaderElection.enabled }}
+        - --leader-elect
+        {{- end }}
+        - --health-probe-bind-address=:{{ .Values.healthProbe.port }}
+        command:
+        - /manager
+        env:
+        - name: DEBUG
+          value: "{{ .Values.operator.debug }}"
+        - name: SHAPEBLOCK_WS_URL
+          value: {{ .Values.operator.websocketUrl }}
+        - name: SHAPEBLOCK_API_URL
+          value: {{ .Values.operator.apiUrl }}
+        - name: SHAPEBLOCK_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shapeblock-credentials
+              key: api-key
+        - name: SHAPEBLOCK_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: shapeblock-credentials
+              key: license-key
+        - name: SHAPEBLOCK_LICENSE_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: shapeblock-credentials
+              key: license-email
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: {{ .Values.healthProbe.port }}
+          initialDelaySeconds: {{ .Values.healthProbe.livenessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthProbe.livenessProbe.periodSeconds }}
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: {{ .Values.healthProbe.port }}
+          initialDelaySeconds: {{ .Values.healthProbe.readinessProbe.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthProbe.readinessProbe.periodSeconds }}
+        resources:
+          {{- toYaml .Values.operator.resources | nindent 12 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      securityContext:
+        runAsNonRoot: true
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: 10

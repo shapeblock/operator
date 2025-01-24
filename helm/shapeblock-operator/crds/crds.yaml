@@ -1,0 +1,202 @@
+# AppBuild CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: appbuilds.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: AppBuild
+    listKind: AppBuildList
+    plural: appbuilds
+    singular: appbuild
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required:
+            - appName
+            properties:
+              appName:
+                type: string
+              gitRef:
+                type: string
+              imageTag:
+                type: string
+              helmValues:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              message:
+                type: string
+---
+# App CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: apps.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: App
+    listKind: AppList
+    plural: apps
+    singular: app
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required:
+            - displayName
+            - build
+            - registry
+            properties:
+              displayName:
+                type: string
+              build:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    enum: [dockerfile, buildpack, image]
+              registry:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  secretName:
+                    type: string
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              message:
+                type: string
+---
+# Project CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: projects.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: Project
+    listKind: ProjectList
+    plural: projects
+    singular: project
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              displayName:
+                type: string
+              description:
+                type: string
+              registrySecret:
+                type: string
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              message:
+                type: string
+---
+# Service CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: services.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: Service
+    listKind: ServiceList
+    plural: services
+    singular: service
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            required:
+            - appName
+            - chart
+            - image
+            properties:
+              appName:
+                type: string
+              chart:
+                type: object
+                required:
+                - name
+                properties:
+                  name:
+                    type: string
+                  repo:
+                    type: string
+                  repoURL:
+                    type: string
+                  version:
+                    type: string
+              image:
+                type: object
+                required:
+                - repository
+                - tag
+                properties:
+                  repository:
+                    type: string
+                  tag:
+                    type: string
+                  pullPolicy:
+                    type: string
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              message:
+                type: string
