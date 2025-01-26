@@ -1,6 +1,0 @@
-apiVersion: apps.shapeblock.io/v1alpha1
-kind: Project
-metadata:
-  name: py-dev2
-spec:
-  description: "Test all failure scenarios"

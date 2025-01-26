@@ -268,7 +268,7 @@ spec:
                   type: object
                 type: array
               gitRef:
-                description: Git reference to build (commit, branch, tag)
+                description: Git reference to build (commit SHA)
                 type: string
               helmValues:
                 description: HelmValues for deployment
@@ -280,9 +280,6 @@ spec:
             required:
             - appName
             type: object
-            x-kubernetes-validations:
-            - message: At least one of gitRef or imageTag must be specified
-              rule: has(self.gitRef) || has(self.imageTag)
           status:
             description: AppBuildStatus defines the observed state of AppBuild
             properties:

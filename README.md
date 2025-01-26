@@ -286,6 +286,19 @@ status:
 
 Handles the build process.
 
+# Helm chart deploy
+
+```sh
+# Package the chart
+helm package helm/shapeblock-operator
+
+# Login to GHCR
+echo $GITHUB_TOKEN | helm registry login ghcr.io -u USERNAME --password-stdin
+
+# Push the chart
+helm push shapeblock-operator-0.1.1.tgz oci://ghcr.io/shapeblock/charts
+```
+
 # TODOs
 - [x] identify patchable fields in app and appbuild CR
 - [x] service CR

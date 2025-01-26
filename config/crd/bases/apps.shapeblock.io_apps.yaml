@@ -92,12 +92,6 @@ spec:
                 required:
                 - url
                 type: object
-              helmValues:
-                description: |-
-                  HelmValues contains values to be passed to the Helm chart
-                  This can include node affinity settings for the deployed application
-                type: object
-                x-kubernetes-preserve-unknown-fields: true
               registry:
                 description: Registry configuration for storing built images
                 properties:

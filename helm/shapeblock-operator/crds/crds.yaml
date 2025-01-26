@@ -1,7 +1,9 @@
-# AppBuild CRD
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: appbuilds.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -12,41 +14,329 @@ spec:
     singular: appbuild
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.appName
+      name: App
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AppBuild is the Schema for the appbuilds API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AppBuildSpec defines the desired state of AppBuild
+            properties:
+              appName:
+                description: AppName references the App CR
+                type: string
+              buildNodeAffinity:
+                description: |-
+                  BuildNodeAffinity defines the node affinity settings for build jobs
+                  This affects where Kaniko and Buildpack jobs are scheduled
+                properties:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    description: |-
+                      The scheduler will prefer to schedule pods to nodes that satisfy
+                      the affinity expressions specified by this field, but it may choose
+                      a node that violates one or more of the expressions. The node that is
+                      most preferred is the one with the greatest sum of weights, i.e.
+                      for each node that meets all of the scheduling requirements (resource
+                      request, requiredDuringScheduling affinity expressions, etc.),
+                      compute a sum by iterating through the elements of this field and adding
+                      "weight" to the sum if the node matches the corresponding matchExpressions; the
+                      node(s) with the highest sum are the most preferred.
+                    items:
+                      description: |-
+                        An empty preferred scheduling term matches all objects with implicit weight 0
+                        (i.e. it's a no-op). A null preferred scheduling term matches no objects (i.e. is also a no-op).
+                      properties:
+                        preference:
+                          description: A node selector term, associated with the corresponding
+                            weight.
+                          properties:
+                            matchExpressions:
+                              description: A list of node selector requirements by
+                                node's labels.
+                              items:
+                                description: |-
+                                  A node selector requirement is a selector that contains values, a key, and an operator
+                                  that relates the key and values.
+                                properties:
+                                  key:
+                                    description: The label key that the selector applies
+                                      to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      Represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists, DoesNotExist. Gt, and Lt.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      An array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. If the operator is Gt or Lt, the values
+                                      array must have a single element, which will be interpreted as an integer.
+                                      This array is replaced during a strategic merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchFields:
+                              description: A list of node selector requirements by
+                                node's fields.
+                              items:
+                                description: |-
+                                  A node selector requirement is a selector that contains values, a key, and an operator
+                                  that relates the key and values.
+                                properties:
+                                  key:
+                                    description: The label key that the selector applies
+                                      to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      Represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists, DoesNotExist. Gt, and Lt.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      An array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. If the operator is Gt or Lt, the values
+                                      array must have a single element, which will be interpreted as an integer.
+                                      This array is replaced during a strategic merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        weight:
+                          description: Weight associated with matching the corresponding
+                            nodeSelectorTerm, in the range 1-100.
+                          format: int32
+                          type: integer
+                      required:
+                      - preference
+                      - weight
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    description: |-
+                      If the affinity requirements specified by this field are not met at
+                      scheduling time, the pod will not be scheduled onto the node.
+                      If the affinity requirements specified by this field cease to be met
+                      at some point during pod execution (e.g. due to an update), the system
+                      may or may not try to eventually evict the pod from its node.
+                    properties:
+                      nodeSelectorTerms:
+                        description: Required. A list of node selector terms. The
+                          terms are ORed.
+                        items:
+                          description: |-
+                            A null or empty node selector term matches no objects. The requirements of
+                            them are ANDed.
+                            The TopologySelectorTerm type implements a subset of the NodeSelectorTerm.
+                          properties:
+                            matchExpressions:
+                              description: A list of node selector requirements by
+                                node's labels.
+                              items:
+                                description: |-
+                                  A node selector requirement is a selector that contains values, a key, and an operator
+                                  that relates the key and values.
+                                properties:
+                                  key:
+                                    description: The label key that the selector applies
+                                      to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      Represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists, DoesNotExist. Gt, and Lt.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      An array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. If the operator is Gt or Lt, the values
+                                      array must have a single element, which will be interpreted as an integer.
+                                      This array is replaced during a strategic merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchFields:
+                              description: A list of node selector requirements by
+                                node's fields.
+                              items:
+                                description: |-
+                                  A node selector requirement is a selector that contains values, a key, and an operator
+                                  that relates the key and values.
+                                properties:
+                                  key:
+                                    description: The label key that the selector applies
+                                      to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      Represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists, DoesNotExist. Gt, and Lt.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      An array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. If the operator is Gt or Lt, the values
+                                      array must have a single element, which will be interpreted as an integer.
+                                      This array is replaced during a strategic merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    required:
+                    - nodeSelectorTerms
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
+              buildVars:
+                description: Additional build environment variables
+                items:
+                  properties:
+                    key:
+                      description: Name of the build variable
+                      type: string
+                    value:
+                      description: Value of the build variable
+                      type: string
+                  required:
+                  - key
+                  - value
+                  type: object
+                type: array
+              gitRef:
+                description: Git reference to build (commit SHA)
+                type: string
+              helmValues:
+                description: HelmValues for deployment
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              imageTag:
+                description: ImageTag for this specific build
+                type: string
+            required:
+            - appName
+            type: object
+          status:
+            description: AppBuildStatus defines the observed state of AppBuild
+            properties:
+              buildEndTime:
+                description: Time when the build process completed (before deployment
+                  phase)
+                format: date-time
+                type: string
+              buildStartTime:
+                description: Time when the actual build process started (when pod
+                  starts running)
+                format: date-time
+                type: string
+              completionTime:
+                format: date-time
+                type: string
+              gitCommit:
+                description: Git commit SHA of the code being built
+                type: string
+              imageTag:
+                description: Image tag for the built container
+                type: string
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                default: Pending
+                description: Current phase of the build
+                enum:
+                - Pending
+                - Building
+                - Deploying
+                - Completed
+                - Failed
+                type: string
+              podName:
+                description: |-
+                  Build pod details for log streaming
+                  Only set for dockerfile and buildpack builds
+                type: string
+              startTime:
+                description: Timestamps
+                format: date-time
+                type: string
+            type: object
+        type: object
     served: true
     storage: true
     subresources:
       status: {}
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            required:
-            - appName
-            properties:
-              appName:
-                type: string
-              gitRef:
-                type: string
-              imageTag:
-                type: string
-              helmValues:
-                type: object
-                x-kubernetes-preserve-unknown-fields: true
-          status:
-            type: object
-            properties:
-              phase:
-                type: string
-              message:
-                type: string
 ---
-# App CRD
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: apps.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -57,49 +347,128 @@ spec:
     singular: app
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.displayName
+      name: Display Name
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: App is the Schema for the apps API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AppSpec defines the desired state of App
+            properties:
+              build:
+                description: Build configuration template
+                properties:
+                  builderImage:
+                    description: Builder image for buildpack builds
+                    type: string
+                  image:
+                    description: Prebuilt image to deploy
+                    type: string
+                  type:
+                    description: 'Type of build: dockerfile, buildpack, or image'
+                    enum:
+                    - dockerfile
+                    - buildpack
+                    - image
+                    type: string
+                required:
+                - type
+                type: object
+              description:
+                description: Description of the application
+                type: string
+              displayName:
+                description: DisplayName is the human-readable name of the application
+                type: string
+              git:
+                description: Git repository configuration
+                properties:
+                  branch:
+                    description: Branch to use by default
+                    type: string
+                  isPrivate:
+                    description: IsPrivate indicates if the git repository is private
+                    type: boolean
+                  secretName:
+                    description: Secret name containing git credentials
+                    type: string
+                  url:
+                    description: URL of the git repository
+                    type: string
+                required:
+                - url
+                type: object
+              registry:
+                description: Registry configuration for storing built images
+                properties:
+                  secretName:
+                    description: Secret name containing registry credentials
+                    type: string
+                  url:
+                    description: URL of the container registry
+                    type: string
+                type: object
+            required:
+            - build
+            - displayName
+            - registry
+            type: object
+          status:
+            description: AppStatus defines the observed state of App
+            properties:
+              lastUpdated:
+                description: Last time the status was updated
+                format: date-time
+                type: string
+              latestBuild:
+                description: Latest successful build
+                type: string
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                description: Current phase of the application
+                type: string
+            type: object
+        type: object
     served: true
     storage: true
     subresources:
       status: {}
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            required:
-            - displayName
-            - build
-            - registry
-            properties:
-              displayName:
-                type: string
-              build:
-                type: object
-                properties:
-                  type:
-                    type: string
-                    enum: [dockerfile, buildpack, image]
-              registry:
-                type: object
-                properties:
-                  url:
-                    type: string
-                  secretName:
-                    type: string
-          status:
-            type: object
-            properties:
-              phase:
-                type: string
-              message:
-                type: string
 ---
-# Project CRD
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: projects.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -110,36 +479,78 @@ spec:
     singular: project
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.displayName
+      name: Display Name
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Project is the Schema for the projects API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ProjectSpec defines the desired state of Project
+            properties:
+              description:
+                description: Description of the project
+                type: string
+              displayName:
+                description: DisplayName is the human-readable name of the project
+                type: string
+              registrySecret:
+                description: RegistrySecret references a secret containing registry
+                  credentials
+                type: string
+            type: object
+          status:
+            description: ProjectStatus defines the observed state of Project
+            properties:
+              lastUpdated:
+                description: Last time the status was updated
+                format: date-time
+                type: string
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                description: Current phase of the project
+                type: string
+            type: object
+        type: object
     served: true
     storage: true
     subresources:
       status: {}
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            properties:
-              displayName:
-                type: string
-              description:
-                type: string
-              registrySecret:
-                type: string
-          status:
-            type: object
-            properties:
-              phase:
-                type: string
-              message:
-                type: string
 ---
-# Service CRD
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
   name: services.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -150,53 +561,107 @@ spec:
     singular: service
   scope: Namespaced
   versions:
-  - name: v1alpha1
-    served: true
-    storage: true
-    subresources:
-      status: {}
+  - additionalPrinterColumns:
+    - jsonPath: .spec.appName
+      name: App
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .status.url
+      name: URL
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        type: object
+        description: Service is the Schema for the services API
         properties:
-          spec:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
             type: object
-            required:
-            - appName
-            - chart
-            - image
+          spec:
+            description: ServiceSpec defines the desired state of Service
             properties:
               appName:
+                description: AppName is the name of the application
                 type: string
               chart:
-                type: object
-                required:
-                - name
+                description: Chart configuration
                 properties:
                   name:
+                    description: Name of the chart
                     type: string
                   repo:
+                    description: Predefined repository name (e.g., "bitnami", "stable")
                     type: string
                   repoURL:
+                    description: Custom repository URL
                     type: string
                   version:
+                    description: Version of the chart
                     type: string
-              image:
-                type: object
                 required:
-                - repository
-                - tag
+                - name
+                type: object
+              helmValues:
+                description: Raw helm values to be passed to the chart
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              image:
+                description: Image configuration
                 properties:
+                  pullPolicy:
+                    type: string
                   repository:
                     type: string
                   tag:
                     type: string
-                  pullPolicy:
-                    type: string
-          status:
+                required:
+                - repository
+                - tag
+                type: object
+            required:
+            - appName
+            - chart
+            - image
             type: object
+          status:
+            description: ServiceStatus defines the observed state of Service
             properties:
-              phase:
+              helmRelease:
+                description: Name of the Helm release
                 type: string
               message:
+                description: Human-readable message indicating details about current
+                  phase
                 type: string
+              phase:
+                description: 'Current phase of the service: Pending, Deploying, Deployed,
+                  Failed'
+                type: string
+              url:
+                description: URL where the service is accessible
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

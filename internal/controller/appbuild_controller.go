@@ -119,20 +119,52 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		buildCopy.Status.Phase = "Pending"
 		buildCopy.Status.StartTime = &metav1.Time{Time: time.Now()}
 
-		// If neither gitRef nor imageTag is specified, find the most recent successful build
-		if build.Spec.GitRef == "" && build.Spec.ImageTag == "" {
+		// If gitRef is specified, check for existing successful builds with the same gitRef
+		if build.Spec.GitRef != "" {
 			buildList := &appsv1alpha1.AppBuildList{}
 			if err := r.List(ctx, buildList,
 				client.InNamespace(build.Namespace),
-				client.MatchingFields{"spec.appName": build.Spec.AppName},
-				client.MatchingFields{"status.phase": "Completed"}); err != nil {
+				client.MatchingFields{"spec.appName": build.Spec.AppName}); err != nil {
 				return r.failBuild(ctx, build, fmt.Sprintf("failed to list previous builds: %v", err))
 			}
 
 			var latestBuild *appsv1alpha1.AppBuild
 			for i := range buildList.Items {
-				if latestBuild == nil || buildList.Items[i].Status.CompletionTime.After(latestBuild.Status.CompletionTime.Time) {
-					latestBuild = &buildList.Items[i]
+				if buildList.Items[i].Status.Phase == "Completed" && buildList.Items[i].Spec.GitRef == build.Spec.GitRef {
+					if latestBuild == nil || buildList.Items[i].Status.CompletionTime.After(latestBuild.Status.CompletionTime.Time) {
+						latestBuild = &buildList.Items[i]
+					}
+				}
+			}
+
+			if latestBuild != nil {
+				log.Info("Found existing successful build for gitRef, reusing image regardless of specified imageTag",
+					"buildName", latestBuild.Name,
+					"gitRef", build.Spec.GitRef,
+					"existingImageTag", latestBuild.Status.ImageTag,
+					"specifiedImageTag", build.Spec.ImageTag)
+
+				// Reuse the image from the latest successful build
+				buildCopy.Status.Phase = "Deploying"
+				buildCopy.Status.Message = fmt.Sprintf("Reusing image from build %s (same gitRef)", latestBuild.Name)
+				buildCopy.Status.ImageTag = latestBuild.Status.ImageTag
+				buildCopy.Status.GitCommit = latestBuild.Status.GitCommit
+			}
+		} else if build.Spec.GitRef == "" && build.Spec.ImageTag == "" {
+			// If neither gitRef nor imageTag is specified, find the most recent successful build
+			buildList := &appsv1alpha1.AppBuildList{}
+			if err := r.List(ctx, buildList,
+				client.InNamespace(build.Namespace),
+				client.MatchingFields{"spec.appName": build.Spec.AppName}); err != nil {
+				return r.failBuild(ctx, build, fmt.Sprintf("failed to list previous builds: %v", err))
+			}
+
+			var latestBuild *appsv1alpha1.AppBuild
+			for i := range buildList.Items {
+				if buildList.Items[i].Status.Phase == "Completed" {
+					if latestBuild == nil || buildList.Items[i].Status.CompletionTime.After(latestBuild.Status.CompletionTime.Time) {
+						latestBuild = &buildList.Items[i]
+					}
 				}
 			}
 
@@ -274,17 +306,38 @@ func (r *AppBuildReconciler) handleInsufficientResources(ctx context.Context, po
 		if build.Status.StartTime != nil && time.Since(build.Status.StartTime.Time) > 10*time.Minute {
 			// Get the pending pod's events for detailed error message
 			eventList := &corev1.EventList{}
-			if err := r.List(ctx, eventList,
+			listOpts := []client.ListOption{
 				client.InNamespace(pod.Namespace),
-				client.MatchingFields{"involvedObject.name": pod.Name}); err != nil {
-				log.Error(err, "Failed to get pod events")
+			}
+			// Try with field selector first
+			err := r.List(ctx, eventList, append(listOpts, client.MatchingFields{"involvedObject.name": pod.Name})...)
+			if err != nil {
+				// If index doesn't exist, fall back to filtering events manually
+				if strings.Contains(err.Error(), "Index with name field:involvedObject.name does not exist") {
+					if err := r.List(ctx, eventList, client.InNamespace(pod.Namespace)); err != nil {
+						log.Error(err, "Failed to get pod events")
+						return ctrl.Result{}, nil
+					}
+					// Filter events manually
+					filteredEvents := &corev1.EventList{}
+					for _, event := range eventList.Items {
+						if event.InvolvedObject.Name == pod.Name {
+							filteredEvents.Items = append(filteredEvents.Items, event)
+						}
+					}
+					eventList = filteredEvents
+				} else {
+					log.Error(err, "Failed to get pod events")
+					return ctrl.Result{}, nil
+				}
 			}
 
 			var resourceIssues []string
 			for _, event := range eventList.Items {
 				if strings.Contains(event.Message, "Insufficient memory") ||
 					strings.Contains(event.Message, "Insufficient cpu") ||
-					strings.Contains(event.Message, "OutOf") {
+					strings.Contains(event.Message, "OutOf") ||
+					strings.Contains(event.Message, "node(s) didn't match Pod's node affinity/selector") {
 					resourceIssues = append(resourceIssues, event.Message)
 				}
 			}
@@ -495,7 +548,10 @@ func (r *AppBuildReconciler) monitorDockerfileBuild(ctx context.Context, app *ap
 
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
-			build.Status.ImageTag = build.Spec.ImageTag // Store the image tag in status
+			// Only set ImageTag from spec if we haven't already set it (from image reuse)
+			if build.Status.ImageTag == "" {
+				build.Status.ImageTag = build.Spec.ImageTag
+			}
 			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
@@ -540,8 +596,14 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Create new build job
-			if err := r.handleBuildpackBuild(ctx, app, build); err != nil {
-				return r.failBuild(ctx, build, fmt.Sprintf("failed to create build job: %v", err))
+			if build.Status.Phase == "Pending" {
+				log.Info("Starting buildpack build",
+					"buildName", build.Name,
+					"appName", app.Name,
+					"builderImage", app.Spec.Build.BuilderImage)
+				if err := r.handleBuildpackBuild(ctx, app, build); err != nil {
+					return r.failBuild(ctx, build, fmt.Sprintf("failed to create build job: %v", err))
+				}
 			}
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
@@ -601,7 +663,10 @@ func (r *AppBuildReconciler) monitorBuildpackBuild(ctx context.Context, app *app
 
 			build.Status.Phase = "Deploying"
 			build.Status.Message = "Build completed, deploying application"
-			build.Status.ImageTag = build.Spec.ImageTag
+			// Only set ImageTag from spec if we haven't already set it (from image reuse)
+			if build.Status.ImageTag == "" {
+				build.Status.ImageTag = build.Spec.ImageTag
+			}
 			build.Status.BuildEndTime = &metav1.Time{Time: time.Now()}
 			if err := r.Status().Update(ctx, build); err != nil {
 				return ctrl.Result{}, err
@@ -1584,7 +1649,7 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		defaultValues["defaultImageTag"] = tag
 	} else {
 		defaultValues["defaultImage"] = fmt.Sprintf("%s/%s/%s", app.Spec.Registry.URL, app.Namespace, app.Name)
-		defaultValues["defaultImageTag"] = build.Spec.ImageTag
+		defaultValues["defaultImageTag"] = build.Status.ImageTag
 	}
 
 	// If user provided helm values, merge them with defaults
@@ -1729,17 +1794,37 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			if pod.Status.Phase == corev1.PodPending {
 				// Get the pod's events for detailed error message
 				eventList := &corev1.EventList{}
-				if err := r.List(ctx, eventList,
+				listOpts := []client.ListOption{
 					client.InNamespace(pod.Namespace),
-					client.MatchingFields{"involvedObject.name": pod.Name}); err != nil {
-					log.Error(err, "Failed to get pod events")
-					continue
+				}
+				// Try with field selector first
+				err := r.List(ctx, eventList, append(listOpts, client.MatchingFields{"involvedObject.name": pod.Name})...)
+				if err != nil {
+					// If index doesn't exist, fall back to filtering events manually
+					if strings.Contains(err.Error(), "Index with name field:involvedObject.name does not exist") {
+						if err := r.List(ctx, eventList, client.InNamespace(pod.Namespace)); err != nil {
+							log.Error(err, "Failed to get pod events")
+							return ctrl.Result{}, nil
+						}
+						// Filter events manually
+						filteredEvents := &corev1.EventList{}
+						for _, event := range eventList.Items {
+							if event.InvolvedObject.Name == pod.Name {
+								filteredEvents.Items = append(filteredEvents.Items, event)
+							}
+						}
+						eventList = filteredEvents
+					} else {
+						log.Error(err, "Failed to get pod events")
+						return ctrl.Result{}, nil
+					}
 				}
 
 				for _, event := range eventList.Items {
 					if strings.Contains(event.Message, "Insufficient memory") ||
 						strings.Contains(event.Message, "Insufficient cpu") ||
-						strings.Contains(event.Message, "OutOf") {
+						strings.Contains(event.Message, "OutOf") ||
+						strings.Contains(event.Message, "node(s) didn't match Pod's node affinity/selector") {
 						resourceIssues = append(resourceIssues,
 							fmt.Sprintf("Pod %s: %s", pod.Name, event.Message))
 					}
@@ -2019,6 +2104,22 @@ func (r *AppBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return fmt.Errorf("failed to create websocket client: %v", err)
 		}
 		r.WebsocketClient = client
+	}
+
+	// Add index for appName field
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1alpha1.AppBuild{}, "spec.appName", func(obj client.Object) []string {
+		build := obj.(*appsv1alpha1.AppBuild)
+		return []string{build.Spec.AppName}
+	}); err != nil {
+		return err
+	}
+
+	// Add index for events involvedObject.name field
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Event{}, "involvedObject.name", func(obj client.Object) []string {
+		event := obj.(*corev1.Event)
+		return []string{event.InvolvedObject.Name}
+	}); err != nil {
+		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).

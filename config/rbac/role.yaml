@@ -14,6 +14,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps.shapeblock.io
   resources:
   - appbuilds
