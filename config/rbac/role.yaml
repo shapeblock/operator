@@ -14,14 +14,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
   - apps.shapeblock.io
   resources:
   - appbuilds
@@ -70,6 +62,7 @@ rules:
   - namespaces
   - pods
   - secrets
+  - serviceaccounts
   verbs:
   - create
   - delete
@@ -90,6 +83,19 @@ rules:
   - helm.cattle.io
   resources:
   - helmcharts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
   verbs:
   - create
   - delete

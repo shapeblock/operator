@@ -107,6 +107,10 @@ type AppBuildStatus struct {
 	// Time when the build process completed (before deployment phase)
 	BuildEndTime *metav1.Time `json:"buildEndTime,omitempty"`
 
+	// Name of the first failed helm job, used to track original failure
+	// +optional
+	FailedHelmJobName string `json:"failedHelmJobName,omitempty"`
+
 	// Timestamps
 	StartTime      *metav1.Time `json:"startTime,omitempty"`
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`

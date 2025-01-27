@@ -38,7 +38,6 @@ import (
 
 	"encoding/base64"
 
-	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
 	"github.com/shapeblock/operator/pkg/utils"
 	"gopkg.in/yaml.v3"
@@ -1406,9 +1405,9 @@ EOF
 			Name:      build.Name,
 			Namespace: build.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":      app.Name,
-				"app.kubernetes.io/component": "build",
-				"build.shapeblock.io/id":      build.Name,
+				"app.kubernetes.io/managed-by": "shapeblock-operator",
+				"app.kubernetes.io/name":       app.Name,
+				"build.shapeblock.io/id":       build.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -1416,9 +1415,9 @@ EOF
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app.kubernetes.io/name":      app.Name,
-						"app.kubernetes.io/component": "build",
-						"build.shapeblock.io/id":      build.Name,
+						"app.kubernetes.io/managed-by": "shapeblock-operator",
+						"app.kubernetes.io/name":       app.Name,
+						"build.shapeblock.io/id":       build.Name,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -1512,6 +1511,7 @@ EOF
 		return err
 	}
 
+	log.Info("Created Helm job", "job", job.Name)
 	return nil
 }
 
@@ -1612,32 +1612,56 @@ func (r *AppBuildReconciler) CreateOrPatch(ctx context.Context, obj client.Objec
 func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	// Add debug logging
-	log.Info("Received app and build objects",
-		"app", app != nil,
-		"build", build != nil,
-		"appName", app.Name,
-		"buildName", build.Name,
-		"buildNamespace", build.Namespace)
-
-	// Existing validation
-	if app == nil {
-		return fmt.Errorf("app is nil")
-	}
-	if build == nil {
-		return fmt.Errorf("build is nil")
-	}
-	if app.Name == "" {
-		return fmt.Errorf("app name is empty")
-	}
-	if build.Namespace == "" {
-		return fmt.Errorf("build namespace is empty")
+	// Check if this is the latest build for the app
+	buildList := &appsv1alpha1.AppBuildList{}
+	if err := r.List(ctx, buildList,
+		client.InNamespace(build.Namespace),
+		client.MatchingFields{"spec.appName": app.Name}); err != nil {
+		return fmt.Errorf("failed to list builds: %v", err)
 	}
 
-	log.Info("Creating/Updating HelmChart",
-		"app", app.Name,
-		"namespace", build.Namespace,
-		"buildName", build.Name)
+	var latestBuild *appsv1alpha1.AppBuild
+	for i := range buildList.Items {
+		if latestBuild == nil || buildList.Items[i].CreationTimestamp.After(latestBuild.CreationTimestamp.Time) {
+			latestBuild = &buildList.Items[i]
+		}
+	}
+
+	if latestBuild == nil || latestBuild.Name != build.Name {
+		log.Info("Skipping helm job creation as this is not the latest build",
+			"buildName", build.Name,
+			"latestBuild", latestBuild.Name)
+		return nil
+	}
+
+	// Check for existing helm job
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-helm", app.Name),
+		Namespace: build.Namespace,
+	}, existingJob)
+
+	if err == nil {
+		// If job exists and failed, delete it so we can retry
+		if existingJob.Status.Failed > 0 {
+			background := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, existingJob, &client.DeleteOptions{
+				PropagationPolicy: &background,
+			}); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete failed helm job: %v", err)
+			}
+			// Wait a moment for the job to be deleted
+			time.Sleep(2 * time.Second)
+		} else if existingJob.Status.Active > 0 {
+			// If job is still running, wait for it
+			log.Info("Waiting for existing helm job to complete",
+				"job", existingJob.Name,
+				"namespace", existingJob.Namespace)
+			return nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check for existing helm job: %v", err)
+	}
 
 	// Default values for nxs-universal-chart
 	defaultValues := map[string]interface{}{}
@@ -1667,60 +1691,135 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		return fmt.Errorf("failed to marshal helm values: %v", err)
 	}
 
-	helmChart := &helmv1.HelmChart{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "helm.cattle.io/v1",
-			Kind:       "HelmChart",
-		},
+	// Create ConfigMap to store Helm values
+	valuesCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      app.Name,
+			Name:      fmt.Sprintf("%s-helm-values", build.Name),
 			Namespace: build.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "shapeblock-operator",
 				"app.kubernetes.io/name":       app.Name,
+				"build.shapeblock.io/id":       build.Name,
 			},
 		},
-		Spec: helmv1.HelmChartSpec{
-			Chart:           "nxs-universal-chart",
-			Version:         "2.8.1",
-			Repo:            "https://registry.nixys.io/chartrepo/public",
-			TargetNamespace: build.Namespace,
-			ValuesContent:   string(valuesYAML),
+		Data: map[string]string{
+			"values.yaml": string(valuesYAML),
 		},
 	}
 
-	// First try to get existing HelmChart
-	existing := &helmv1.HelmChart{}
-	err = r.Get(ctx, types.NamespacedName{
-		Name:      app.Name,
-		Namespace: build.Namespace,
-	}, existing)
-
-	// Create new HelmChart if it doesn't exist
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to get HelmChart: %v", err)
+	// Create or update ConfigMap
+	if err := r.Create(ctx, valuesCM); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create values configmap: %v", err)
 		}
-		log.Info("Creating new HelmChart",
-			"appName", app.Name,
-			"buildName", build.Name,
-			"namespace", build.Namespace)
-		return r.Create(ctx, helmChart)
+		// Update if exists
+		if err := r.Update(ctx, valuesCM); err != nil {
+			return fmt.Errorf("failed to update values configmap: %v", err)
+		}
 	}
 
-	// Check if update is needed by comparing specs
-	if existing.Spec.Chart != helmChart.Spec.Chart ||
-		existing.Spec.Version != helmChart.Spec.Version ||
-		existing.Spec.Repo != helmChart.Spec.Repo ||
-		existing.Spec.TargetNamespace != helmChart.Spec.TargetNamespace ||
-		existing.Spec.ValuesContent != helmChart.Spec.ValuesContent {
-		log.Info("Updating HelmChart due to spec changes",
-			"name", existing.GetName(),
-			"namespace", existing.GetNamespace())
-		existing.Spec = helmChart.Spec
-		return r.Update(ctx, existing)
+	// Create Helm install/upgrade job
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-helm", app.Name),
+			Namespace: build.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "shapeblock-operator",
+				"app.kubernetes.io/name":       app.Name,
+				"build.shapeblock.io/id":       build.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: pointer.Int32(0),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "shapeblock-operator",
+						"app.kubernetes.io/name":       app.Name,
+						"build.shapeblock.io/id":       build.Name,
+					},
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "helm-deployer", // Use the pre-created service account
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "helm",
+							Image:   "alpine/helm:3.17",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(`
+set -e
+# Check if release exists
+if helm status %s -n %s >/dev/null 2>&1; then
+  echo "Upgrading existing release"
+  helm upgrade %s oci://ghcr.io/shapeblock/charts/universal-chart \
+    --namespace %s \
+    --version 2.8.1 \
+    --values /values/values.yaml \
+    --wait \
+    --timeout 10m
+else
+  echo "Installing new release"
+  helm install %s oci://ghcr.io/shapeblock/charts/universal-chart \
+    --namespace %s \
+    --version 2.8.1 \
+    --values /values/values.yaml \
+    --wait \
+    --timeout 10m
+fi
+`, app.Name, build.Namespace, app.Name, build.Namespace, app.Name, build.Namespace),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "values",
+									MountPath: "/values",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "values",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: valuesCM.Name,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
+	// Create job
+	if err := r.Create(ctx, job); err != nil {
+		if errors.IsAlreadyExists(err) {
+			log.Info("Build job already exists, skipping creation",
+				"job", build.Name,
+				"namespace", build.Namespace)
+			return nil
+		}
+		log.Error(err, "Failed to create build job",
+			"jobName", job.Name,
+			"namespace", job.Namespace)
+		return err
+	}
+
+	log.Info("Created Helm job", "job", job.Name)
 	return nil
 }
 
@@ -1769,111 +1868,27 @@ func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
 func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	log.Info("Monitoring helm release",
-		"appName", app.Name,
-		"buildName", build.Name)
-
-	// If build is already completed, don't requeue
-	if build.Status.Phase == "Completed" {
+	log.Info("Monitoring helm release", "appName", app.Name, "buildName", build.Name)
+	// If build is already completed or failed, don't requeue
+	if build.Status.Phase == "Completed" || build.Status.Phase == "Failed" {
 		return ctrl.Result{}, nil
 	}
 
 	// Check if we've exceeded the timeout (10 minutes)
 	if build.Status.BuildEndTime != nil && time.Since(build.Status.BuildEndTime.Time) > 10*time.Minute {
-		// Get all pods for detailed resource issues before failing
-		podList := &corev1.PodList{}
-		if err := r.List(ctx, podList,
-			client.InNamespace(build.Namespace),
-			client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
-			return r.failBuild(ctx, build, "Helm deployment timed out and failed to get pod status")
-		}
-
-		var resourceIssues []string
-		for _, pod := range podList.Items {
-			// Check if pod is pending due to resource constraints
-			if pod.Status.Phase == corev1.PodPending {
-				// Get the pod's events for detailed error message
-				eventList := &corev1.EventList{}
-				listOpts := []client.ListOption{
-					client.InNamespace(pod.Namespace),
-				}
-				// Try with field selector first
-				err := r.List(ctx, eventList, append(listOpts, client.MatchingFields{"involvedObject.name": pod.Name})...)
-				if err != nil {
-					// If index doesn't exist, fall back to filtering events manually
-					if strings.Contains(err.Error(), "Index with name field:involvedObject.name does not exist") {
-						if err := r.List(ctx, eventList, client.InNamespace(pod.Namespace)); err != nil {
-							log.Error(err, "Failed to get pod events")
-							return ctrl.Result{}, nil
-						}
-						// Filter events manually
-						filteredEvents := &corev1.EventList{}
-						for _, event := range eventList.Items {
-							if event.InvolvedObject.Name == pod.Name {
-								filteredEvents.Items = append(filteredEvents.Items, event)
-							}
-						}
-						eventList = filteredEvents
-					} else {
-						log.Error(err, "Failed to get pod events")
-						return ctrl.Result{}, nil
-					}
-				}
-
-				for _, event := range eventList.Items {
-					if strings.Contains(event.Message, "Insufficient memory") ||
-						strings.Contains(event.Message, "Insufficient cpu") ||
-						strings.Contains(event.Message, "OutOf") ||
-						strings.Contains(event.Message, "node(s) didn't match Pod's node affinity/selector") {
-						resourceIssues = append(resourceIssues,
-							fmt.Sprintf("Pod %s: %s", pod.Name, event.Message))
-					}
-				}
-			}
-		}
-
-		if len(resourceIssues) > 0 {
-			failureMsg := "Helm deployment failed due to insufficient cluster resources after waiting for 10 minutes.\n"
-			failureMsg += "Resource issues:\n- " + strings.Join(resourceIssues, "\n- ")
-			failureMsg += "\nPlease check your resource requests/limits or cluster capacity."
-			return r.failBuild(ctx, build, failureMsg)
-		}
-
-		return r.failBuild(ctx, build, "Helm deployment timed out after 10 minutes. Please check the helm release status and logs.")
+		return r.failBuild(ctx, build, "Helm deployment timed out after 10 minutes")
 	}
 
-	// Get the HelmChart
-	helmChart := &helmv1.HelmChart{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      app.Name,
-		Namespace: app.Namespace,
-	}, helmChart); err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("Waiting for HelmChart to be created",
-				"appName", app.Name,
-				"buildName", build.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{}, fmt.Errorf("failed to get HelmChart: %v", err)
-	}
-
-	// If JobName is empty, wait for it to be populated
-	if helmChart.Status.JobName == "" {
-		log.Info("Waiting for helm job to be created",
-			"appName", app.Name,
-			"buildName", build.Name)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// Get the helm install/upgrade job
+	// Get the helm job
 	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      helmChart.Status.JobName,
-		Namespace: app.Namespace,
-	}, job); err != nil {
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-helm", app.Name),
+		Namespace: build.Namespace,
+	}, job)
+
+	if err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("Waiting for helm job to be available",
-				"jobName", helmChart.Status.JobName,
+			log.Info("Waiting for Helm job to be created",
 				"appName", app.Name,
 				"buildName", build.Name)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1881,81 +1896,78 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		return ctrl.Result{}, err
 	}
 
-	// Check if job completed successfully
-	if isJobComplete(job) {
-		// Check if all pods are ready
+	log.Info("Helm job found", "jobName", job.Name, "namespace", job.Namespace)
+	log.Info("Helm job status", "status", job.Status)
+	// Check if job failed
+	if job.Status.Failed > 0 {
+		log.Info("Helm job failed", "jobName", job.Name, "namespace", job.Namespace)
 
-		log.Info("Checking pod readiness",
-			"appName", app.Name,
-			"buildName", build.Name)
-
-		podList := &corev1.PodList{}
-		if err := r.List(ctx, podList,
-			client.InNamespace(app.Namespace),
-			client.MatchingLabels{"app.kubernetes.io/name": app.Name}); err != nil {
-			return ctrl.Result{}, err
+		// If we've already recorded this job failure, don't process it again
+		if build.Status.FailedHelmJobName == job.Name {
+			return ctrl.Result{}, nil
 		}
 
-		if len(podList.Items) == 0 {
-			log.Info("Waiting for application pods to be created",
-				"appName", app.Name,
-				"buildName", build.Name)
+		// Get the pod for logs
+		pods := &corev1.PodList{}
+		if err := r.List(ctx, pods,
+			client.InNamespace(build.Namespace),
+			client.MatchingLabels{
+				"job-name": job.Name,
+			}); err != nil {
+			log.Error(err, "Failed to get helm job pods")
+			return r.failBuild(ctx, build, "Failed to get Helm job logs")
+		}
+
+		failureMsg := "Helm release failed"
+		if len(pods.Items) > 0 {
+			// Get the logs from the helm job pod
+			req := r.CoreV1Client.Pods(build.Namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{})
+			logs, err := req.DoRaw(ctx)
+			if err != nil {
+				log.Error(err, "Failed to get helm job logs")
+			} else {
+				failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
+			}
+		}
+
+		// Store the failed job name in the build status and mark the build as failed
+		build.Status.FailedHelmJobName = job.Name
+		build.Status.Phase = "Failed"
+		build.Status.Message = failureMsg
+		build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+		if err := r.Status().Update(ctx, build); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.sendBuildStatus(build)
+		return ctrl.Result{}, nil
+	}
+
+	// Check if job completed
+	if job.Status.Succeeded > 0 {
+		// Check if all pods are ready
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList,
+			client.InNamespace(build.Namespace),
+			client.MatchingLabels{
+				"app.kubernetes.io/instance": app.Name,
+			}); err != nil {
+			log.Error(err, "Failed to list application pods")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 
-		allPodsReady := true
+		// Check pod readiness
 		var notReadyPods []string
-		var resourceConstrainedPods []string
-
 		for _, pod := range podList.Items {
-			if pod.Status.Phase == corev1.PodPending {
-				// Check if pending due to resource constraints
-				for _, condition := range pod.Status.Conditions {
-					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-						if strings.Contains(condition.Message, "Insufficient memory") ||
-							strings.Contains(condition.Message, "Insufficient cpu") {
-							resourceConstrainedPods = append(resourceConstrainedPods,
-								fmt.Sprintf("%s (%s)", pod.Name, condition.Message))
-							allPodsReady = false
-							continue
-						}
-					}
-				}
-			}
-
-			// Consider both Running and Succeeded pods as ready states
-			if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded {
-				allPodsReady = false
-				notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Phase: %s)", pod.Name, pod.Status.Phase))
-				continue
-			}
-
-			// Only check pod conditions for Running pods
-			if pod.Status.Phase == corev1.PodRunning {
-				for _, condition := range pod.Status.Conditions {
-					if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
-						allPodsReady = false
-						notReadyPods = append(notReadyPods, fmt.Sprintf("%s (Not Ready: %s)", pod.Name, condition.Message))
-						break
-					}
-				}
+			if !isPodReady(&pod) {
+				notReadyPods = append(notReadyPods, pod.Name)
 			}
 		}
 
-		if !allPodsReady {
-			statusMsg := "Waiting for application pods to be ready"
-			if len(resourceConstrainedPods) > 0 {
-				statusMsg = "Waiting for compute resources to be available"
-				log.Info("Pods waiting for resources",
-					"appName", app.Name,
-					"buildName", build.Name,
-					"resourceConstrainedPods", strings.Join(resourceConstrainedPods, ", "))
-			}
-
-			log.Info("Waiting for pods to be ready",
+		if len(notReadyPods) > 0 {
+			statusMsg := fmt.Sprintf("Waiting for pods to be ready: %s", strings.Join(notReadyPods, ", "))
+			log.Info(statusMsg,
 				"appName", app.Name,
-				"buildName", build.Name,
-				"notReadyPods", strings.Join(notReadyPods, ", "))
+				"buildName", build.Name)
 
 			// Update build status with pod readiness info
 			if build.Status.Message != statusMsg {
@@ -1984,29 +1996,16 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			}
 			r.sendBuildStatus(build)
 		}
+
+		// Delete the completed job
+		background := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, job, &client.DeleteOptions{
+			PropagationPolicy: &background,
+		}); err != nil && !errors.IsNotFound(err) {
+			log.Error(err, "Failed to delete completed job")
+		}
+
 		return ctrl.Result{}, nil
-	} else if isJobFailed(job) {
-		// Get the helm job pod for logs
-		helmPods := &corev1.PodList{}
-		if err := r.List(ctx, helmPods,
-			client.InNamespace(app.Namespace),
-			client.MatchingLabels{"job-name": job.Name}); err != nil {
-			log.Error(err, "Failed to get helm job pods")
-		}
-
-		failureMsg := "Helm release failed"
-		if len(helmPods.Items) > 0 {
-			// Get the logs from the helm job pod
-			req := r.CoreV1Client.Pods(app.Namespace).GetLogs(helmPods.Items[0].Name, &corev1.PodLogOptions{})
-			logs, err := req.DoRaw(ctx)
-			if err != nil {
-				log.Error(err, "Failed to get helm job logs")
-			} else {
-				failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
-			}
-		}
-
-		return r.failBuild(ctx, build, failureMsg)
 	}
 
 	// Still waiting for job to complete
@@ -2015,26 +2014,6 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		"appName", app.Name,
 		"buildName", build.Name)
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-}
-
-// Helper function to check if a job completed successfully
-func isJobComplete(job *batchv1.Job) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to check if a job failed
-func isJobFailed(job *batchv1.Job) bool {
-	for _, condition := range job.Status.Conditions {
-		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }
 
 func (r *AppBuildReconciler) handleDeletion(ctx context.Context, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
@@ -2053,10 +2032,8 @@ func (r *AppBuildReconciler) handleDeletion(ctx context.Context, build *appsv1al
 			log.Info("Deleting build job",
 				"job", job.Name,
 				"namespace", job.Namespace)
-			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-				if !errors.IsNotFound(err) {
-					return ctrl.Result{}, err
-				}
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete failed job")
 			}
 		} else if !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
@@ -2125,4 +2102,23 @@ func (r *AppBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.AppBuild{}).
 		Complete(r)
+}
+
+// Helper function to check if a pod is ready
+func isPodReady(pod *corev1.Pod) bool {
+	// Consider both Running and Succeeded pods as ready states
+	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded {
+		return false
+	}
+
+	// Only check pod conditions for Running pods
+	if pod.Status.Phase == corev1.PodRunning {
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
+				return false
+			}
+		}
+	}
+
+	return true
 }

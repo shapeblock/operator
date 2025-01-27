@@ -296,6 +296,10 @@ spec:
               completionTime:
                 format: date-time
                 type: string
+              failedHelmJobName:
+                description: Name of the first failed helm job, used to track original
+                  failure
+                type: string
               gitCommit:
                 description: Git commit SHA of the code being built
                 type: string

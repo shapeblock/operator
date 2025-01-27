@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,6 +47,9 @@ type ProjectReconciler struct {
 //+kubebuilder:rbac:groups=apps.shapeblock.io,resources=projects/finalizers,verbs=update
 //+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -86,6 +90,83 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Info("Successfully created namespace",
 			"namespace", project.Name,
 			"projectId", project.Name)
+	}
+
+	// Create ServiceAccount for Helm jobs
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "helm-deployer",
+			Namespace: project.Name,
+			Labels: map[string]string{
+				"shapeblock.io/project-id": project.Name,
+				"shapeblock.io/managed-by": "shapeblock-operator",
+			},
+		},
+	}
+	if err := r.Create(ctx, sa); err != nil && !errors.IsAlreadyExists(err) {
+		log.Error(err, "Failed to create ServiceAccount")
+		return r.failProject(ctx, project, fmt.Sprintf("Failed to create ServiceAccount: %v", err))
+	}
+
+	// Create Role for Helm jobs
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "helm-deployer",
+			Namespace: project.Name,
+			Labels: map[string]string{
+				"shapeblock.io/project-id": project.Name,
+				"shapeblock.io/managed-by": "shapeblock-operator",
+			},
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"services", "pods", "configmaps", "secrets"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments", "statefulsets", "replicasets"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				APIGroups: []string{"networking.k8s.io"},
+				Resources: []string{"ingresses"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+		},
+	}
+	if err := r.Create(ctx, role); err != nil && !errors.IsAlreadyExists(err) {
+		log.Error(err, "Failed to create Role")
+		return r.failProject(ctx, project, fmt.Sprintf("Failed to create Role: %v", err))
+	}
+
+	// Create RoleBinding for Helm jobs
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "helm-deployer",
+			Namespace: project.Name,
+			Labels: map[string]string{
+				"shapeblock.io/project-id": project.Name,
+				"shapeblock.io/managed-by": "shapeblock-operator",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      sa.Name,
+				Namespace: sa.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     role.Name,
+		},
+	}
+	if err := r.Create(ctx, rb); err != nil && !errors.IsAlreadyExists(err) {
+		log.Error(err, "Failed to create RoleBinding")
+		return r.failProject(ctx, project, fmt.Sprintf("Failed to create RoleBinding: %v", err))
 	}
 
 	// Copy registry secret - either specified or default
