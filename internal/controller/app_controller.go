@@ -16,9 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
 	"github.com/shapeblock/operator/pkg/utils"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/pointer"
 )
 
 // AppReconciler reconciles a App object
@@ -231,7 +232,27 @@ func (r *AppReconciler) setupPrivateRepo(ctx context.Context, app *appsv1alpha1.
 func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types.NamespacedName) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// 1. Delete all jobs with the label app.kubernetes.io/name: <app-name>
+	// 1. Delete all AppBuilds associated with this app
+	buildList := &appsv1alpha1.AppBuildList{}
+	if err := r.List(ctx, buildList, client.InNamespace(namespacedName.Namespace)); err != nil {
+		log.Error(err, "Failed to list AppBuilds")
+		return ctrl.Result{}, err
+	}
+
+	for _, build := range buildList.Items {
+		if build.Spec.AppName == namespacedName.Name {
+			// Delete each AppBuild
+			if err := r.Delete(ctx, &build); err != nil {
+				if !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete AppBuild", "build", build.Name)
+					return ctrl.Result{}, err
+				}
+			}
+			log.Info("Deleted AppBuild", "build", build.Name)
+		}
+	}
+
+	// 2. Delete all jobs with the label app.kubernetes.io/name: <app-name>
 	jobList := &batchv1.JobList{}
 	labelSelector := labels.SelectorFromSet(map[string]string{
 		"app.kubernetes.io/name": namespacedName.Name,
@@ -244,15 +265,20 @@ func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types
 		return ctrl.Result{}, err
 	}
 
+	background := metav1.DeletePropagationBackground
 	for _, job := range jobList.Items {
-		if err := r.Delete(ctx, &job); err != nil {
-			log.Error(err, "Failed to delete job", "job", job.Name)
-			return ctrl.Result{}, err
+		if err := r.Delete(ctx, &job, &client.DeleteOptions{
+			PropagationPolicy: &background,
+		}); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete job", "job", job.Name)
+				return ctrl.Result{}, err
+			}
 		}
 		log.Info("Deleted job", "job", job.Name)
 	}
 
-	// 2. Delete the SSH secret if it exists
+	// 3. Delete the SSH secret if it exists
 	sshSecret := &corev1.Secret{}
 	sshSecretName := fmt.Sprintf("%s-git-auth", namespacedName.Name)
 	if err := r.Get(ctx, types.NamespacedName{
@@ -265,47 +291,163 @@ func (r *AppReconciler) handleDeletion(ctx context.Context, namespacedName types
 		}
 	} else {
 		if err := r.Delete(ctx, sshSecret); err != nil {
-			log.Error(err, "Failed to delete SSH secret")
-			return ctrl.Result{}, err
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete SSH secret")
+				return ctrl.Result{}, err
+			}
 		}
 		log.Info("Deleted SSH secret", "name", sshSecret.Name)
 	}
 
-	// 3. Delete the HelmChart CR
-	helmChart := &helmv1.HelmChart{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      namespacedName.Name,
-		Namespace: namespacedName.Namespace,
-	}, helmChart); err != nil {
-		if !errors.IsNotFound(err) {
-			log.Error(err, "Failed to get HelmChart")
-			return ctrl.Result{}, err
-		}
-	} else {
-		if err := r.Delete(ctx, helmChart); err != nil {
-			log.Error(err, "Failed to delete HelmChart")
-			return ctrl.Result{}, err
-		}
-		log.Info("Deleted HelmChart", "name", helmChart.Name)
+	// 4. Create a Helm uninstall job
+	uninstallJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-helm-uninstall", namespacedName.Name),
+			Namespace: namespacedName.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "shapeblock-operator",
+				"app.kubernetes.io/name":       namespacedName.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: pointer.Int32(0),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "shapeblock-operator",
+						"app.kubernetes.io/name":       namespacedName.Name,
+					},
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "helm-deployer",
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "helm",
+							Image:   "alpine/helm:3.17",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(`
+set -e
+# Check if release exists
+if helm status %s -n %s >/dev/null 2>&1; then
+  echo "Uninstalling release"
+  helm uninstall %s \
+    --namespace %s \
+    --wait \
+    --timeout 5m
+fi
+`, namespacedName.Name, namespacedName.Namespace, namespacedName.Name, namespacedName.Namespace),
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
-	// 4. Delete the cache PVC
-	pvc := &corev1.PersistentVolumeClaim{}
-	pvcName := fmt.Sprintf("cache-%s", namespacedName.Name)
+	// Create the uninstall job
+	if err := r.Create(ctx, uninstallJob); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			log.Error(err, "Failed to create uninstall job")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Wait for job completion
+	for i := 0; i < 60; i++ { // Wait up to 5 minutes
+		job := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{
+			Name:      uninstallJob.Name,
+			Namespace: uninstallJob.Namespace,
+		}, job)
+
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to get uninstall job")
+				return ctrl.Result{}, err
+			}
+		} else {
+			if job.Status.Succeeded > 0 || job.Status.Failed > 0 {
+				// Job completed (success or failure), delete it
+				if err := r.Delete(ctx, job, &client.DeleteOptions{
+					PropagationPolicy: &background,
+				}); err != nil && !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete uninstall job")
+				}
+				break
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	// 5. Delete all PVCs associated with this app
+	// First, delete the build cache PVC
+	buildCachePVC := &corev1.PersistentVolumeClaim{}
+	buildCachePVCName := fmt.Sprintf("cache-%s", namespacedName.Name)
 	if err := r.Get(ctx, types.NamespacedName{
-		Name:      pvcName,
+		Name:      buildCachePVCName,
 		Namespace: namespacedName.Namespace,
-	}, pvc); err != nil {
+	}, buildCachePVC); err != nil {
 		if !errors.IsNotFound(err) {
-			log.Error(err, "Failed to get cache PVC")
+			log.Error(err, "Failed to get build cache PVC")
 			return ctrl.Result{}, err
 		}
 	} else {
-		if err := r.Delete(ctx, pvc); err != nil {
-			log.Error(err, "Failed to delete cache PVC")
+		// Force delete the PVC by removing finalizers
+		if len(buildCachePVC.Finalizers) > 0 {
+			buildCachePVC.Finalizers = nil
+			if err := r.Update(ctx, buildCachePVC); err != nil {
+				log.Error(err, "Failed to remove finalizers from build cache PVC")
+				return ctrl.Result{}, err
+			}
+		}
+		if err := r.Delete(ctx, buildCachePVC); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete build cache PVC")
+				return ctrl.Result{}, err
+			}
+		}
+		log.Info("Deleted build cache PVC", "name", buildCachePVC.Name)
+	}
+
+	// Then, delete the Kaniko cache PVC if it exists
+	kanikoCachePVC := &corev1.PersistentVolumeClaim{}
+	kanikoCachePVCName := fmt.Sprintf("kaniko-cache-%s", namespacedName.Name)
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      kanikoCachePVCName,
+		Namespace: namespacedName.Namespace,
+	}, kanikoCachePVC); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Error(err, "Failed to get Kaniko cache PVC")
 			return ctrl.Result{}, err
 		}
-		log.Info("Deleted cache PVC", "name", pvc.Name)
+	} else {
+		// Force delete the PVC by removing finalizers
+		if len(kanikoCachePVC.Finalizers) > 0 {
+			kanikoCachePVC.Finalizers = nil
+			if err := r.Update(ctx, kanikoCachePVC); err != nil {
+				log.Error(err, "Failed to remove finalizers from Kaniko cache PVC")
+				return ctrl.Result{}, err
+			}
+		}
+		if err := r.Delete(ctx, kanikoCachePVC); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete Kaniko cache PVC")
+				return ctrl.Result{}, err
+			}
+		}
+		log.Info("Deleted Kaniko cache PVC", "name", kanikoCachePVC.Name)
 	}
 
 	return ctrl.Result{}, nil

@@ -29,11 +29,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	appsv1alpha1 "github.com/shapeblock/operator/api/v1alpha1"
 	"github.com/shapeblock/operator/pkg/utils"
 )
+
+const projectFinalizer = "apps.shapeblock.io/finalizer"
 
 // ProjectReconciler reconciles a Project object
 type ProjectReconciler struct {
@@ -58,6 +61,20 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	project := &appsv1alpha1.Project{}
 	if err := r.Get(ctx, req.NamespacedName, project); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Handle deletion
+	if !project.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, project)
+	}
+
+	// Add finalizer if it doesn't exist
+	if !controllerutil.ContainsFinalizer(project, projectFinalizer) {
+		controllerutil.AddFinalizer(project, projectFinalizer)
+		if err := r.Update(ctx, project); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Initialize status if not set
@@ -189,6 +206,33 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Update status to Active if not already
 	if project.Status.Phase != "Active" {
 		if err := r.updateProjectStatus(ctx, project, "Active", "Project setup completed"); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ProjectReconciler) handleDeletion(ctx context.Context, project *appsv1alpha1.Project) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	if controllerutil.ContainsFinalizer(project, projectFinalizer) {
+		// Delete the namespace
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: project.Name,
+			},
+		}
+		if err := r.Delete(ctx, ns); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete namespace")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Remove finalizer
+		controllerutil.RemoveFinalizer(project, projectFinalizer)
+		if err := r.Update(ctx, project); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

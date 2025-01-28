@@ -66,7 +66,6 @@ type AppBuildReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=helm.cattle.io,resources=helmcharts,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -105,10 +104,18 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		Namespace: build.Namespace,
 		Name:      build.Spec.AppName,
 	}, app); err != nil {
-		log.Error(err, "Unable to fetch App",
-			"appName", build.Spec.AppName,
-			"buildName", build.Name)
-		return r.failBuild(ctx, build, fmt.Sprintf("unable to fetch App %s: %v", build.Spec.AppName, err))
+		if errors.IsNotFound(err) {
+			// If the App is not found and the build is being deleted, just continue with deletion
+			if !build.DeletionTimestamp.IsZero() {
+				return r.handleDeletion(ctx, build)
+			}
+			// Otherwise, mark the build as failed
+			log.Error(err, "Unable to fetch App",
+				"appName", build.Spec.AppName,
+				"buildName", build.Name)
+			return r.failBuild(ctx, build, fmt.Sprintf("App %s not found", build.Spec.AppName))
+		}
+		return ctrl.Result{}, err
 	}
 
 	// Initialize build status if not set
@@ -137,6 +144,7 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 
 			if latestBuild != nil {
+				//TODO: if the build variables are different, we should not reuse the image
 				log.Info("Found existing successful build for gitRef, reusing image regardless of specified imageTag",
 					"buildName", latestBuild.Name,
 					"gitRef", build.Spec.GitRef,
@@ -216,10 +224,7 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err != nil {
 			return result, err
 		}
-		if build.Status.Phase == "Completed" {
-			log.Info("Build completed, creating Helm release",
-				"buildName", build.Name,
-				"appName", app.Name)
+		if build.Status.Phase == "Completed" || build.Status.Phase == "Deploying" {
 
 			if DEBUG {
 				helmValues, _ := json.MarshalIndent(build.Spec.HelmValues, "", "  ")
@@ -245,7 +250,7 @@ func (r *AppBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err != nil {
 			return result, err
 		}
-		if build.Status.Phase == "Completed" {
+		if build.Status.Phase == "Completed" || build.Status.Phase == "Deploying" {
 			if err := r.createOrUpdateHelmRelease(ctx, app, build); err != nil {
 				log.Error(err, "Failed to create Helm release")
 				// Requeue to retry Helm release creation
@@ -1612,55 +1617,17 @@ func (r *AppBuildReconciler) CreateOrPatch(ctx context.Context, obj client.Objec
 func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	// Check if this is the latest build for the app
-	buildList := &appsv1alpha1.AppBuildList{}
-	if err := r.List(ctx, buildList,
-		client.InNamespace(build.Namespace),
-		client.MatchingFields{"spec.appName": app.Name}); err != nil {
-		return fmt.Errorf("failed to list builds: %v", err)
-	}
-
-	var latestBuild *appsv1alpha1.AppBuild
-	for i := range buildList.Items {
-		if latestBuild == nil || buildList.Items[i].CreationTimestamp.After(latestBuild.CreationTimestamp.Time) {
-			latestBuild = &buildList.Items[i]
-		}
-	}
-
-	if latestBuild == nil || latestBuild.Name != build.Name {
-		log.Info("Skipping helm job creation as this is not the latest build",
-			"buildName", build.Name,
-			"latestBuild", latestBuild.Name)
+	// If build is already completed or failed, don't create a new job
+	if build.Status.Phase == "Completed" || build.Status.Phase == "Failed" {
 		return nil
 	}
 
-	// Check for existing helm job
-	existingJob := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      fmt.Sprintf("%s-helm", app.Name),
-		Namespace: build.Namespace,
-	}, existingJob)
-
-	if err == nil {
-		// If job exists and failed, delete it so we can retry
-		if existingJob.Status.Failed > 0 {
-			background := metav1.DeletePropagationBackground
-			if err := r.Delete(ctx, existingJob, &client.DeleteOptions{
-				PropagationPolicy: &background,
-			}); err != nil && !errors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete failed helm job: %v", err)
-			}
-			// Wait a moment for the job to be deleted
-			time.Sleep(2 * time.Second)
-		} else if existingJob.Status.Active > 0 {
-			// If job is still running, wait for it
-			log.Info("Waiting for existing helm job to complete",
-				"job", existingJob.Name,
-				"namespace", existingJob.Namespace)
-			return nil
-		}
-	} else if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to check for existing helm job: %v", err)
+	// If we've already recorded a failed helm job, don't create a new one
+	if build.Status.FailedHelmJobName != "" {
+		log.Info("Skipping helm job creation as a previous attempt has failed",
+			"buildName", build.Name,
+			"failedJob", build.Status.FailedHelmJobName)
+		return nil
 	}
 
 	// Default values for nxs-universal-chart
@@ -1691,7 +1658,42 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		return fmt.Errorf("failed to marshal helm values: %v", err)
 	}
 
-	// Create ConfigMap to store Helm values
+	// Create unique job name for this build
+	jobName := fmt.Sprintf("%s-helm-%s", app.Name, build.Name)
+
+	// Check if job already exists
+	existingJob := &batchv1.Job{}
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      jobName,
+		Namespace: build.Namespace,
+	}, existingJob)
+
+	if err == nil {
+		// Job exists, check its status
+		if existingJob.Status.Failed > 0 {
+			// Store the failed job name and return
+			build.Status.FailedHelmJobName = jobName
+			if err := r.Status().Update(ctx, build); err != nil {
+				return fmt.Errorf("failed to update build status with failed job: %v", err)
+			}
+			return nil
+		}
+		if existingJob.Status.Active > 0 || existingJob.Status.Succeeded > 0 {
+			// Job is still running or has completed successfully, don't create a new one
+			return nil
+		}
+		// Job exists but is not active, failed, or succeeded - we'll delete it and create a new one
+		background := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, existingJob, &client.DeleteOptions{
+			PropagationPolicy: &background,
+		}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete existing job: %v", err)
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check for existing job: %v", err)
+	}
+
+	// Create ConfigMap to store Helm values with unique name for this build
 	valuesCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-helm-values", build.Name),
@@ -1707,13 +1709,25 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 		},
 	}
 
-	// Create or update ConfigMap
-	if err := r.Create(ctx, valuesCM); err != nil {
-		if !errors.IsAlreadyExists(err) {
+	// Check if ConfigMap already exists
+	existingCM := &corev1.ConfigMap{}
+	err = r.Get(ctx, types.NamespacedName{
+		Name:      valuesCM.Name,
+		Namespace: valuesCM.Namespace,
+	}, existingCM)
+
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to check for existing ConfigMap: %v", err)
+		}
+		// ConfigMap doesn't exist, create it
+		if err := r.Create(ctx, valuesCM); err != nil {
 			return fmt.Errorf("failed to create values configmap: %v", err)
 		}
-		// Update if exists
-		if err := r.Update(ctx, valuesCM); err != nil {
+	} else {
+		// ConfigMap exists, update it
+		existingCM.Data = valuesCM.Data
+		if err := r.Update(ctx, existingCM); err != nil {
 			return fmt.Errorf("failed to update values configmap: %v", err)
 		}
 	}
@@ -1721,7 +1735,7 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 	// Create Helm install/upgrade job
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-helm", app.Name),
+			Name:      jobName,
 			Namespace: build.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "shapeblock-operator",
@@ -1740,7 +1754,7 @@ func (r *AppBuildReconciler) createOrUpdateHelmRelease(ctx context.Context, app 
 					},
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: "helm-deployer", // Use the pre-created service account
+					ServiceAccountName: "helm-deployer",
 					RestartPolicy:      corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
@@ -1805,18 +1819,15 @@ fi
 		},
 	}
 
-	// Create job
+	// Create job only if it doesn't exist
 	if err := r.Create(ctx, job); err != nil {
 		if errors.IsAlreadyExists(err) {
-			log.Info("Build job already exists, skipping creation",
-				"job", build.Name,
-				"namespace", build.Namespace)
+			log.Info("Helm job already exists, skipping creation",
+				"job", job.Name,
+				"namespace", job.Namespace)
 			return nil
 		}
-		log.Error(err, "Failed to create build job",
-			"jobName", job.Name,
-			"namespace", job.Namespace)
-		return err
+		return fmt.Errorf("failed to create helm job: %v", err)
 	}
 
 	log.Info("Created Helm job", "job", job.Name)
@@ -1868,7 +1879,6 @@ func (r *AppBuildReconciler) sendBuildStatus(build *appsv1alpha1.AppBuild) {
 func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1alpha1.App, build *appsv1alpha1.AppBuild) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	log.Info("Monitoring helm release", "appName", app.Name, "buildName", build.Name)
 	// If build is already completed or failed, don't requeue
 	if build.Status.Phase == "Completed" || build.Status.Phase == "Failed" {
 		return ctrl.Result{}, nil
@@ -1882,30 +1892,27 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 	// Get the helm job
 	job := &batchv1.Job{}
 	err := r.Get(ctx, types.NamespacedName{
-		Name:      fmt.Sprintf("%s-helm", app.Name),
+		Name:      fmt.Sprintf("%s-helm-%s", app.Name, build.Name),
 		Namespace: build.Namespace,
 	}, job)
 
 	if err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("Waiting for Helm job to be created",
-				"appName", app.Name,
-				"buildName", build.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			// Only log and requeue if we're not in Completed phase
+			if build.Status.Phase != "Completed" {
+				log.Info("Waiting for Helm job to be created",
+					"appName", app.Name,
+					"buildName", build.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	log.Info("Helm job found", "jobName", job.Name, "namespace", job.Namespace)
-	log.Info("Helm job status", "status", job.Status)
 	// Check if job failed
 	if job.Status.Failed > 0 {
 		log.Info("Helm job failed", "jobName", job.Name, "namespace", job.Namespace)
-
-		// If we've already recorded this job failure, don't process it again
-		if build.Status.FailedHelmJobName == job.Name {
-			return ctrl.Result{}, nil
-		}
 
 		// Get the pod for logs
 		pods := &corev1.PodList{}
@@ -1928,17 +1935,36 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			} else {
 				failureMsg = fmt.Sprintf("Helm release failed:\n%s", string(logs))
 			}
+
+			// Mark build as failed with the logs
+			build.Status.Phase = "Failed"
+			build.Status.Message = failureMsg
+			build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
+			if err := r.Status().Update(ctx, build); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.sendBuildStatus(build)
+
+			// Only delete after we've captured logs and updated status
+			background := metav1.DeletePropagationBackground
+			if err := r.Delete(ctx, job, &client.DeleteOptions{
+				PropagationPolicy: &background,
+			}); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete failed job")
+			}
+
+			// Delete the ConfigMap
+			cm := &corev1.ConfigMap{}
+			if err := r.Get(ctx, types.NamespacedName{
+				Name:      fmt.Sprintf("%s-helm-values", build.Name),
+				Namespace: build.Namespace,
+			}, cm); err == nil {
+				if err := r.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete values ConfigMap")
+				}
+			}
 		}
 
-		// Store the failed job name in the build status and mark the build as failed
-		build.Status.FailedHelmJobName = job.Name
-		build.Status.Phase = "Failed"
-		build.Status.Message = failureMsg
-		build.Status.CompletionTime = &metav1.Time{Time: time.Now()}
-		if err := r.Status().Update(ctx, build); err != nil {
-			return ctrl.Result{}, err
-		}
-		r.sendBuildStatus(build)
 		return ctrl.Result{}, nil
 	}
 
@@ -1983,6 +2009,25 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			"appName", app.Name,
 			"buildName", build.Name)
 
+		// Get final logs for successful job
+		pods := &corev1.PodList{}
+		if err := r.List(ctx, pods,
+			client.InNamespace(build.Namespace),
+			client.MatchingLabels{
+				"job-name": job.Name,
+			}); err != nil {
+			log.Error(err, "Failed to get helm job pods")
+		} else if len(pods.Items) > 0 {
+			// Get the logs from the helm job pod
+			req := r.CoreV1Client.Pods(build.Namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{})
+			logs, err := req.DoRaw(ctx)
+			if err != nil {
+				log.Error(err, "Failed to get helm job logs")
+			} else {
+				log.Info("Helm job logs", "logs", string(logs))
+			}
+		}
+
 		// Only update status if not already completed
 		if build.Status.Phase != "Completed" {
 			log.Info("Helm release completed successfully",
@@ -1997,12 +2042,23 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 			r.sendBuildStatus(build)
 		}
 
-		// Delete the completed job
+		// Delete the successful job and its ConfigMap only after status is updated
 		background := metav1.DeletePropagationBackground
 		if err := r.Delete(ctx, job, &client.DeleteOptions{
 			PropagationPolicy: &background,
 		}); err != nil && !errors.IsNotFound(err) {
 			log.Error(err, "Failed to delete completed job")
+		}
+
+		// Delete the ConfigMap
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      fmt.Sprintf("%s-helm-values", build.Name),
+			Namespace: build.Namespace,
+		}, cm); err == nil {
+			if err := r.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete values ConfigMap")
+			}
 		}
 
 		return ctrl.Result{}, nil
