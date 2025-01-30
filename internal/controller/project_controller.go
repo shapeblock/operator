@@ -137,18 +137,55 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
+				// Core API resources that most charts need
 				APIGroups: []string{""},
-				Resources: []string{"services", "pods", "configmaps", "secrets"},
-				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+				Resources: []string{
+					"services", "pods", "pods/exec", "pods/portforward", "pods/log",
+					"configmaps", "secrets", "serviceaccounts",
+					"persistentvolumeclaims", "persistentvolumes",
+					"events", "endpoints", "nodes",
+				},
+				Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 			},
 			{
+				// Apps API group for workload controllers
 				APIGroups: []string{"apps"},
-				Resources: []string{"deployments", "statefulsets", "replicasets"},
+				Resources: []string{
+					"deployments", "statefulsets", "replicasets",
+					"daemonsets", "controllerrevisions",
+				},
+				Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Batch jobs and cronjobs
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
 				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 			},
 			{
+				// Networking resources
 				APIGroups: []string{"networking.k8s.io"},
-				Resources: []string{"ingresses"},
+				Resources: []string{
+					"ingresses", "ingressclasses", "networkpolicies",
+				},
+				Verbs: []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// RBAC resources that charts might need to create
+				APIGroups: []string{"rbac.authorization.k8s.io"},
+				Resources: []string{"roles", "rolebindings"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Autoscaling for HPA
+				APIGroups: []string{"autoscaling"},
+				Resources: []string{"horizontalpodautoscalers"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+			{
+				// Policy for PodDisruptionBudgets
+				APIGroups: []string{"policy"},
+				Resources: []string{"poddisruptionbudgets"},
 				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 			},
 		},
@@ -217,22 +254,32 @@ func (r *ProjectReconciler) handleDeletion(ctx context.Context, project *appsv1a
 	log := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(project, projectFinalizer) {
-		// Delete the namespace
-		ns := &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: project.Name,
-			},
-		}
-		if err := r.Delete(ctx, ns); err != nil {
-			if !errors.IsNotFound(err) {
-				log.Error(err, "Failed to delete namespace")
-				return ctrl.Result{}, err
+		// Check if namespace still exists
+		ns := &corev1.Namespace{}
+		err := r.Get(ctx, types.NamespacedName{Name: project.Name}, ns)
+		if err == nil {
+			// Namespace exists, delete it if not already being deleted
+			if ns.DeletionTimestamp.IsZero() {
+				log.Info("Deleting namespace", "namespace", project.Name)
+				if err := r.Delete(ctx, ns); err != nil && !errors.IsNotFound(err) {
+					log.Error(err, "Failed to delete namespace")
+					return ctrl.Result{}, err
+				}
 			}
+			// Namespace is still being deleted, requeue
+			log.Info("Waiting for namespace deletion", "namespace", project.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		} else if !errors.IsNotFound(err) {
+			// Error other than NotFound
+			log.Error(err, "Failed to get namespace")
+			return ctrl.Result{}, err
 		}
 
-		// Remove finalizer
+		// Namespace is gone, remove finalizer
+		log.Info("Namespace deleted, removing finalizer", "namespace", project.Name)
 		controllerutil.RemoveFinalizer(project, projectFinalizer)
 		if err := r.Update(ctx, project); err != nil {
+			log.Error(err, "Failed to remove finalizer")
 			return ctrl.Result{}, err
 		}
 	}

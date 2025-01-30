@@ -11,7 +11,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "shapeblock-operator.fullname" . }}
+  name: sb-manager-role
 rules:
 - apiGroups:
   - ""
@@ -20,9 +20,16 @@ rules:
   - namespaces
   - pods
   - pods/log
+  - pods/exec
+  - pods/portforward
   - secrets
   - serviceaccounts
   - services
+  - endpoints
+  - nodes
+  - persistentvolumes
+  - persistentvolumeclaims
+  - configmaps
   verbs:
   - create
   - delete
@@ -37,6 +44,8 @@ rules:
   - deployments
   - statefulsets
   - replicasets
+  - controllerrevisions
+  - daemonsets
   verbs:
   - create
   - delete
@@ -49,6 +58,32 @@ rules:
   - networking.k8s.io
   resources:
   - ingresses
+  - ingressclasses
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
   verbs:
   - create
   - delete
@@ -67,7 +102,7 @@ rules:
   resources: ["appbuilds/finalizers", "projects/finalizers"]
   verbs: ["update"]
 - apiGroups: ["batch"]
-  resources: ["jobs"]
+  resources: ["jobs", "cronjobs"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["helm.cattle.io"]
   resources: ["helmcharts"]

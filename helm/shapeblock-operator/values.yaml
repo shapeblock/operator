@@ -2,7 +2,7 @@
 operator:
   image:
     repository: ghcr.io/shapeblock/operator
-    tag: v3.69
+    tag: v3.104
     pullPolicy: IfNotPresent
   resources:
     requests:

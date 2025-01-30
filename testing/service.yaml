@@ -4,18 +4,13 @@ metadata:
   labels:
     app.kubernetes.io/name: redis-app
     app.kubernetes.io/managed-by: shapeblock-operator
-  name: redis
-  namespace: my-project
+  name: redis-01
+  namespace: service-ns
 spec:
-  appName: redis-app
   chart:
     name: redis
     version: "17.15.4"
     repoURL: "https://charts.bitnami.com/bitnami"
-  image:
-    repository: bitnami/redis
-    tag: "7.2.4"
-    pullPolicy: IfNotPresent
   helmValues:
     architecture: standalone
     auth:

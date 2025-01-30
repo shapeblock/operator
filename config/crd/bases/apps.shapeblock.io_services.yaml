@@ -15,9 +15,6 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.appName
-      name: App
-      type: string
     - jsonPath: .status.phase
       name: Status
       type: string
@@ -52,9 +49,6 @@ spec:
           spec:
             description: ServiceSpec defines the desired state of Service
             properties:
-              appName:
-                description: AppName is the name of the application
-                type: string
               chart:
                 description: Chart configuration
                 properties:
@@ -77,23 +71,8 @@ spec:
                 description: Raw helm values to be passed to the chart
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
-              image:
-                description: Image configuration
-                properties:
-                  pullPolicy:
-                    type: string
-                  repository:
-                    type: string
-                  tag:
-                    type: string
-                required:
-                - repository
-                - tag
-                type: object
             required:
-            - appName
             - chart
-            - image
             type: object
           status:
             description: ServiceStatus defines the observed state of Service

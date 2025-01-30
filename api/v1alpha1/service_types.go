@@ -23,14 +23,9 @@ import (
 
 // ServiceSpec defines the desired state of Service
 type ServiceSpec struct {
-	// AppName is the name of the application
-	AppName string `json:"appName"`
-
 	// Chart configuration
+	// +kubebuilder:validation:Required
 	Chart ChartSpec `json:"chart"`
-
-	// Image configuration
-	Image ImageSpec `json:"image"`
 
 	// Raw helm values to be passed to the chart
 	HelmValues runtime.RawExtension `json:"helmValues,omitempty"`
@@ -39,22 +34,20 @@ type ServiceSpec struct {
 // ChartSpec defines the Helm chart configuration
 type ChartSpec struct {
 	// Name of the chart
+	// +kubebuilder:validation:Required
+	// +kubebuilder:immutable
 	Name string `json:"name"`
 
 	// Version of the chart
 	Version string `json:"version,omitempty"`
 
 	// Predefined repository name (e.g., "bitnami", "stable")
+	// +kubebuilder:immutable
 	Repo string `json:"repo,omitempty"`
 
 	// Custom repository URL
+	// +kubebuilder:immutable
 	RepoURL string `json:"repoURL,omitempty"`
-}
-
-type ImageSpec struct {
-	Repository string `json:"repository"`
-	Tag        string `json:"tag"`
-	PullPolicy string `json:"pullPolicy,omitempty"`
 }
 
 // ServiceStatus defines the observed state of Service
@@ -74,7 +67,6 @@ type ServiceStatus struct {
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
-//+kubebuilder:printcolumn:name="App",type="string",JSONPath=".spec.appName"
 //+kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.phase"
 //+kubebuilder:printcolumn:name="URL",type="string",JSONPath=".status.url"
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"

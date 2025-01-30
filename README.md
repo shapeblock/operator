@@ -296,7 +296,7 @@ helm package helm/shapeblock-operator
 echo $GITHUB_TOKEN | helm registry login ghcr.io -u USERNAME --password-stdin
 
 # Push the chart
-helm push shapeblock-operator-0.1.1.tgz oci://ghcr.io/shapeblock/charts
+helm push shapeblock-operator-0.1.3.tgz oci://ghcr.io/shapeblock/charts
 ```
 
 # TODOs

@@ -1,4 +1,219 @@
 ---
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: projects.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: Project
+    listKind: ProjectList
+    plural: projects
+    singular: project
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.displayName
+      name: Display Name
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Project is the Schema for the projects API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ProjectSpec defines the desired state of Project
+            properties:
+              description:
+                description: Description of the project
+                type: string
+              displayName:
+                description: DisplayName is the human-readable name of the project
+                type: string
+              registrySecret:
+                description: RegistrySecret references a secret containing registry
+                  credentials
+                type: string
+            type: object
+          status:
+            description: ProjectStatus defines the observed state of Project
+            properties:
+              lastUpdated:
+                description: Last time the status was updated
+                format: date-time
+                type: string
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                description: Current phase of the project
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.1
+  name: apps.apps.shapeblock.io
+spec:
+  group: apps.shapeblock.io
+  names:
+    kind: App
+    listKind: AppList
+    plural: apps
+    singular: app
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.displayName
+      name: Display Name
+      type: string
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: App is the Schema for the apps API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AppSpec defines the desired state of App
+            properties:
+              build:
+                description: Build configuration template
+                properties:
+                  builderImage:
+                    description: Builder image for buildpack builds
+                    type: string
+                  image:
+                    description: Prebuilt image to deploy
+                    type: string
+                  type:
+                    description: 'Type of build: dockerfile, buildpack, or image'
+                    enum:
+                    - dockerfile
+                    - buildpack
+                    - image
+                    type: string
+                required:
+                - type
+                type: object
+              description:
+                description: Description of the application
+                type: string
+              displayName:
+                description: DisplayName is the human-readable name of the application
+                type: string
+              git:
+                description: Git repository configuration
+                properties:
+                  branch:
+                    description: Branch to use by default
+                    type: string
+                  isPrivate:
+                    description: IsPrivate indicates if the git repository is private
+                    type: boolean
+                  secretName:
+                    description: Secret name containing git credentials
+                    type: string
+                  url:
+                    description: URL of the git repository
+                    type: string
+                required:
+                - url
+                type: object
+              registry:
+                description: Registry configuration for storing built images
+                properties:
+                  secretName:
+                    description: Secret name containing registry credentials
+                    type: string
+                  url:
+                    description: URL of the container registry
+                    type: string
+                type: object
+            required:
+            - build
+            - displayName
+            - registry
+            type: object
+          status:
+            description: AppStatus defines the observed state of App
+            properties:
+              lastUpdated:
+                description: Last time the status was updated
+                format: date-time
+                type: string
+              latestBuild:
+                description: Latest successful build
+                type: string
+              message:
+                description: Human-readable message
+                type: string
+              phase:
+                description: Current phase of the application
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -341,220 +556,6 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.1
-  name: apps.apps.shapeblock.io
-spec:
-  group: apps.shapeblock.io
-  names:
-    kind: App
-    listKind: AppList
-    plural: apps
-    singular: app
-  scope: Namespaced
-  versions:
-  - additionalPrinterColumns:
-    - jsonPath: .spec.displayName
-      name: Display Name
-      type: string
-    - jsonPath: .status.phase
-      name: Status
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: App is the Schema for the apps API
-        properties:
-          apiVersion:
-            description: |-
-              APIVersion defines the versioned schema of this representation of an object.
-              Servers should convert recognized schemas to the latest internal value, and
-              may reject unrecognized values.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-            type: string
-          kind:
-            description: |-
-              Kind is a string value representing the REST resource this object represents.
-              Servers may infer this from the endpoint the client submits requests to.
-              Cannot be updated.
-              In CamelCase.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-            type: string
-          metadata:
-            type: object
-          spec:
-            description: AppSpec defines the desired state of App
-            properties:
-              build:
-                description: Build configuration template
-                properties:
-                  builderImage:
-                    description: Builder image for buildpack builds
-                    type: string
-                  image:
-                    description: Prebuilt image to deploy
-                    type: string
-                  type:
-                    description: 'Type of build: dockerfile, buildpack, or image'
-                    enum:
-                    - dockerfile
-                    - buildpack
-                    - image
-                    type: string
-                required:
-                - type
-                type: object
-              description:
-                description: Description of the application
-                type: string
-              displayName:
-                description: DisplayName is the human-readable name of the application
-                type: string
-              git:
-                description: Git repository configuration
-                properties:
-                  branch:
-                    description: Branch to use by default
-                    type: string
-                  isPrivate:
-                    description: IsPrivate indicates if the git repository is private
-                    type: boolean
-                  secretName:
-                    description: Secret name containing git credentials
-                    type: string
-                  url:
-                    description: URL of the git repository
-                    type: string
-                required:
-                - url
-                type: object
-              registry:
-                description: Registry configuration for storing built images
-                properties:
-                  secretName:
-                    description: Secret name containing registry credentials
-                    type: string
-                  url:
-                    description: URL of the container registry
-                    type: string
-                type: object
-            required:
-            - build
-            - displayName
-            - registry
-            type: object
-          status:
-            description: AppStatus defines the observed state of App
-            properties:
-              lastUpdated:
-                description: Last time the status was updated
-                format: date-time
-                type: string
-              latestBuild:
-                description: Latest successful build
-                type: string
-              message:
-                description: Human-readable message
-                type: string
-              phase:
-                description: Current phase of the application
-                type: string
-            type: object
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
----
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.16.1
-  name: projects.apps.shapeblock.io
-spec:
-  group: apps.shapeblock.io
-  names:
-    kind: Project
-    listKind: ProjectList
-    plural: projects
-    singular: project
-  scope: Namespaced
-  versions:
-  - additionalPrinterColumns:
-    - jsonPath: .spec.displayName
-      name: Display Name
-      type: string
-    - jsonPath: .status.phase
-      name: Status
-      type: string
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
-    name: v1alpha1
-    schema:
-      openAPIV3Schema:
-        description: Project is the Schema for the projects API
-        properties:
-          apiVersion:
-            description: |-
-              APIVersion defines the versioned schema of this representation of an object.
-              Servers should convert recognized schemas to the latest internal value, and
-              may reject unrecognized values.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-            type: string
-          kind:
-            description: |-
-              Kind is a string value representing the REST resource this object represents.
-              Servers may infer this from the endpoint the client submits requests to.
-              Cannot be updated.
-              In CamelCase.
-              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-            type: string
-          metadata:
-            type: object
-          spec:
-            description: ProjectSpec defines the desired state of Project
-            properties:
-              description:
-                description: Description of the project
-                type: string
-              displayName:
-                description: DisplayName is the human-readable name of the project
-                type: string
-              registrySecret:
-                description: RegistrySecret references a secret containing registry
-                  credentials
-                type: string
-            type: object
-          status:
-            description: ProjectStatus defines the observed state of Project
-            properties:
-              lastUpdated:
-                description: Last time the status was updated
-                format: date-time
-                type: string
-              message:
-                description: Human-readable message
-                type: string
-              phase:
-                description: Current phase of the project
-                type: string
-            type: object
-        type: object
-    served: true
-    storage: true
-    subresources:
-      status: {}
----
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  annotations:
-    controller-gen.kubebuilder.io/version: v0.16.1
   name: services.apps.shapeblock.io
 spec:
   group: apps.shapeblock.io
@@ -566,9 +567,6 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.appName
-      name: App
-      type: string
     - jsonPath: .status.phase
       name: Status
       type: string
@@ -603,9 +601,6 @@ spec:
           spec:
             description: ServiceSpec defines the desired state of Service
             properties:
-              appName:
-                description: AppName is the name of the application
-                type: string
               chart:
                 description: Chart configuration
                 properties:
@@ -628,23 +623,8 @@ spec:
                 description: Raw helm values to be passed to the chart
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
-              image:
-                description: Image configuration
-                properties:
-                  pullPolicy:
-                    type: string
-                  repository:
-                    type: string
-                  tag:
-                    type: string
-                required:
-                - repository
-                - tag
-                type: object
             required:
-            - appName
             - chart
-            - image
             type: object
           status:
             description: ServiceStatus defines the observed state of Service

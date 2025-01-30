@@ -1984,7 +1984,7 @@ func (r *AppBuildReconciler) monitorHelmRelease(ctx context.Context, app *appsv1
 		// Check pod readiness
 		var notReadyPods []string
 		for _, pod := range podList.Items {
-			if !isPodReady(&pod) {
+			if !utils.IsPodReady(&pod) {
 				notReadyPods = append(notReadyPods, pod.Name)
 			}
 		}
@@ -2158,23 +2158,4 @@ func (r *AppBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.AppBuild{}).
 		Complete(r)
-}
-
-// Helper function to check if a pod is ready
-func isPodReady(pod *corev1.Pod) bool {
-	// Consider both Running and Succeeded pods as ready states
-	if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded {
-		return false
-	}
-
-	// Only check pod conditions for Running pods
-	if pod.Status.Phase == corev1.PodRunning {
-		for _, condition := range pod.Status.Conditions {
-			if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
-				return false
-			}
-		}
-	}
-
-	return true
 }
